@@ -514,6 +514,27 @@
 #       Remove this patch when vLLM PR #42524 and #44243 is included in the supported
 #       upstream vLLM version.
 #
+# ** 16. File: platform/patch_lopt_tokenization.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.renderers.hf.HfRenderer`
+#    Why:
+#       Long text prompts are normally tokenized serially before they reach the
+#       Ascend worker. LoPT reduces this CPU-side latency by tokenizing
+#       overlapping chunks concurrently and merging only position-identical
+#       token spans.
+#    How:
+#       When VLLM_ASCEND_LOPT_ENABLE=1, attach a long-lived LoPT executor to
+#       text-only HF renderers, render chat templates to text, and route long
+#       prompts through offset-aware overlap matching. Unsupported tokenizers,
+#       invalid offsets, merge failures, and task failures use the original
+#       tokenizer path.
+#    Related PR (if no, explain why):
+#       No. This is an experimental plugin-side prototype; the generic feature
+#       should eventually be contributed to upstream vLLM.
+#    Future Plan:
+#       Upstream the Renderer integration after tokenizer compatibility and
+#       end-to-end performance are validated.
+#
 # * Worker Patch:
 # ===============
 #

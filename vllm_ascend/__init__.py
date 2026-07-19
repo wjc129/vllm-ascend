@@ -15,6 +15,17 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+
+from . import envs
+
+# LoPT uses an outer Python thread pool. Configure conservative tokenizer
+# parallelism defaults before importing vLLM/transformers-facing modules, while
+# respecting values explicitly provided by the user.
+if envs.VLLM_ASCEND_LOPT_ENABLE:
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 _GLOBAL_PATCH_APPLIED = False
 
 

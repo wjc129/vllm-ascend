@@ -1,0 +1,448 @@
+\documentclass[UTF8,11pt,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+% Treat underscores in file names and identifiers as text characters instead
+% of mathematical subscript operators.
+\usepackage[strings]{underscore}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!65!black,
+  pdftitle={vLLM Ascend 项目目录与模块说明},
+  pdfauthor={项目代码分析整理}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{vLLM Ascend 项目目录与模块说明}
+\fancyhead[R]{\thepage}
+\setlength{\headheight}{14pt}
+
+\setlist[itemize]{leftmargin=2em,itemsep=0.3em}
+\setlist[enumerate]{leftmargin=2em,itemsep=0.3em}
+\renewcommand{\arraystretch}{1.25}
+% These commands are robust because \folder is also used in section titles.
+\DeclareRobustCommand{\folder}[1]{\texttt{\detokenize{#1}}}
+\DeclareRobustCommand{\code}[1]{\texttt{\detokenize{#1}}}
+% PDF bookmarks are plain strings; strip the formatting commands there.
+\pdfstringdefDisableCommands{%
+  \def\folder#1{#1}%
+  \def\code#1{#1}%
+}
+
+\definecolor{codebg}{RGB}{246,248,250}
+\definecolor{codeframe}{RGB}{210,215,220}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  breaklines=true,
+  tabsize=2
+}
+
+\title{\bfseries vLLM Ascend 项目目录与模块说明}
+\author{基于项目目录 \folder{C:/Users/Administrator/Desktop/找工作/vllm-ascend} 整理}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文档介绍 \folder{vllm-ascend} 项目的总体定位、顶层目录、核心 Python 包、底层 CANN/C++ 算子、测试和开发工具，并给出主执行流程以及 LoPT 并行 tokenization 功能可能涉及的代码位置。该项目不是独立的 HTTP 推理服务，而是上游 vLLM 的 Ascend NPU 硬件后端插件。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{项目定位}
+
+\folder{vllm-ascend} 的主要功能是把上游 vLLM 的模型推理框架适配到华为 Ascend NPU。上游 vLLM 负责 API、请求预处理、tokenization、通用调度和输出处理；本项目主要负责 NPU 平台注册、设备初始化、模型执行、Attention、KV Cache、采样、分布式通信和自定义算子。
+
+项目可粗略划分为三层：
+
+\begin{lstlisting}
+工程、文档、测试和协作配置
+            |
+Python 运行时：vllm_ascend/
+            |
+C++ / AscendC / CANN 高性能算子：csrc/
+\end{lstlisting}
+
+真正影响在线推理运行的核心目录是 \folder{vllm_ascend/} 和 \folder{csrc/}。
+
+\section{顶层目录}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.21\textwidth} >{\raggedright\arraybackslash}p{0.58\textwidth} >{\centering\arraybackslash}p{0.12\textwidth}}
+\toprule
+\textbf{目录} & \textbf{主要作用} & \textbf{参与推理} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{目录} & \textbf{主要作用} & \textbf{参与推理} \\
+\midrule
+\endhead
+\folder{.agents/} & Codex 或其他智能代理使用的项目技能、规则和说明。 & 否 \\
+\folder{.claude/} & Claude 辅助开发相关说明。 & 否 \\
+\folder{.gemini/} & Gemini 配置和代码风格说明。 & 否 \\
+\folder{.git/} & Git 仓库元数据、对象和版本历史。 & 否 \\
+\folder{.github/} & GitHub Actions、Issue 模板、公共 Action 和 CI 工作流。 & 否 \\
+\folder{benchmarks/} & 吞吐、延迟、Serving 和算子性能测试及结果处理。 & 测试时 \\
+\folder{cmake/} & 顶层 CMake 公共构建函数。 & 编译时 \\
+\folder{csrc/} & C++、AscendC 和 CANN 自定义高性能算子。 & 是 \\
+\folder{docs/} & 中英文文档、文档网站源码、主题覆盖和构建钩子。 & 否 \\
+\folder{examples/} & 量化、PD 分离、动态负载均衡、强化学习等使用示例。 & 示例运行 \\
+\folder{tests/} & 单元测试、端到端测试、夜间和每周测试。 & 测试时 \\
+\folder{tools/} & Benchmark、请求发送、静态检查、回归定位和文档生成工具。 & 工具运行 \\
+\folder{vllm_ascend/} & Ascend 插件的核心 Python 实现。 & 是 \\
+\bottomrule
+\end{longtable}
+
+\section{核心 Python 包：\folder{vllm_ascend/}}
+
+\subsection{\folder{worker/}：推理 Worker 与模型执行器}
+
+该目录是运行时最核心的目录之一，负责把上游 Scheduler 产生的任务转换成 NPU 模型执行。
+
+主要文件包括：
+
+\begin{itemize}
+  \item \folder{worker.py}：定义 \code{NPUWorker}，负责设备初始化、模型加载、KV Cache 初始化、推理执行和 Pipeline Parallel 通信。
+  \item \folder{model_runner_v1.py}：当前主要模型执行路径，负责输入准备、Attention metadata、模型 forward、logits 和采样状态。
+  \item \folder{npu_input_batch.py}：维护 NPU 上的请求批次和输入状态。
+  \item \folder{block_table.py}：维护请求与 KV Cache block 的映射。
+  \item \folder{pcp_utils.py}：Parallel Context Processing 相关逻辑。
+  \item \folder{encoder_acl_graph.py}：Encoder 模型 ACL Graph 管理。
+  \item \folder{v2/}：开发中的 v2 ModelRunner 实现。
+\end{itemize}
+
+其主要调用关系为：
+
+\begin{lstlisting}
+NPUWorker.execute_model()
+        |
+NPUModelRunner.execute_model()
+        |
+input_ids / positions / KV blocks
+        |
+Attention + model forward
+        |
+logits + token sampling
+\end{lstlisting}
+
+\subsection{\folder{attention/}：Ascend Attention 后端}
+
+该目录实现不同模型和硬件场景下的 Attention 计算，包括：
+
+\begin{itemize}
+  \item \folder{attention_v1.py}：普通 Attention 后端。
+  \item \folder{mla_v1.py}：Multi-head Latent Attention（MLA）。
+  \item \folder{dsa_v1.py}：DSA Attention。
+  \item \folder{sfa_v1.py}：SFA Attention。
+  \item \folder{fa3_v1.py}：FA3 后端。
+  \item \folder{attention_mask.py}：Attention mask 构造。
+  \item \folder{context_parallel/}：上下文并行实现。
+  \item \folder{kvcomp_attn/}：KV 压缩 Attention 相关实现。
+\end{itemize}
+
+这里处理的是 token ID 已经转为张量之后的 Attention 计算，不负责文本 tokenization。
+
+\subsection{\folder{ops/}：Python 层 Ascend 算子}
+
+该目录提供 Python 层的自定义算子、融合算子和算子注册，包括 Linear、RMSNorm、LayerNorm、RoPE、MoE、MLA、DSA、多模态 Encoder Attention、Vocabulary Parallel Embedding、权重预取及 Triton 算子。
+
+\folder{register_custom_ops.py} 负责注册部分自定义算子。Python 层算子可能进一步调用 \folder{csrc/} 编译产生的底层扩展。
+
+\subsection{\folder{core/}：Scheduler 与 KV Cache 扩展}
+
+该目录扩展上游 vLLM 的调度和 KV Cache 管理能力，主要包含：
+
+\begin{itemize}
+  \item 动态 batch scheduler；
+  \item 短请求优先 scheduler；
+  \item recompute scheduler；
+  \item profiling chunk scheduler；
+  \item KV Cache 接口；
+  \item 单类型 KV Cache manager。
+\end{itemize}
+
+它决定已经完成 tokenization 的请求如何进入模型，但不处理原始文本。
+
+\subsection{\folder{compilation/}：图编译与 ACL Graph}
+
+负责 Ascend 图编译、执行图管理和图优化，包括：
+
+\begin{itemize}
+  \item ACL Graph 捕获与重放；
+  \item 编译器接口；
+  \item Graph Fusion Pass；
+  \item 编译 Pass 管理。
+\end{itemize}
+
+其目标是减少 Python 调度开销，并复用适合静态执行的 NPU 计算图。
+
+\subsection{\folder{distributed/}：分布式推理与数据传输}
+
+该目录负责 Ascend 分布式执行和跨进程数据传输：
+
+\begin{itemize}
+  \item \folder{device_communicators/}：设备通信实现；
+  \item \folder{kv_transfer/}：KV Cache 传输、Prefill/Decode 分离、Mooncake 和 Ascend Store；
+  \item \folder{weight_transfer/}：运行时权重传输；
+  \item \folder{parallel_state.py}：并行通信组和状态；
+  \item \folder{utils.py}：分布式公共工具。
+\end{itemize}
+
+它服务于 Tensor Parallel、Pipeline Parallel、Data Parallel、Expert Parallel 和 Context Parallel 等并行模式。
+
+\subsection{\folder{models/}：Ascend 特有模型适配}
+
+这里存放必须在插件侧单独实现或适配的模型，包括 DeepSeek V4、DeepSeek V4 MTP 和 Llama Eagle3 Vwn。注册入口是 \folder{models/__init__.py}。
+
+大多数常规模型仍复用上游 vLLM 模型实现，只把底层执行和算子替换为 Ascend 版本。
+
+\subsection{\folder{patch/}：上游 vLLM 运行时 Patch}
+
+由于本项目是硬件插件，一些上游行为通过运行时 patch 进行适配：
+
+\begin{itemize}
+  \item \folder{platform/}：平台、配置、Scheduler、KV Cache、工具解析器等全局 patch；
+  \item \folder{worker/}：Worker、模型执行和模型行为相关 patch。
+\end{itemize}
+
+Patch 加载过程如下：
+
+\begin{lstlisting}
+vLLM loads Ascend plugin
+        |
+adapt_patch()
+        |
+import patch/platform or patch/worker
+        |
+replace or extend upstream behavior
+\end{lstlisting}
+
+如果必须只在当前仓库内接入 LoPT，可以利用这一机制包装上游 Renderer/tokenizer，但正式且通用的 tokenization 实现更适合进入上游 vLLM。
+
+\subsection{\folder{quantization/}：量化适配}
+
+该目录提供 Ascend 量化配置和量化方法，包括 FP8、compressed-tensors、ModelSlim、量化类型解析和不同量化 method adapter。它使上游模型加载器能够选择正确的 Ascend 量化执行方式。
+
+\subsection{\folder{sample/}：NPU Token 采样}
+
+负责把模型输出 logits 转换为下一个 token ID，包括 temperature、top-k、top-p、重复惩罚以及推测解码 rejection sampler。
+
+采样处理的是 \code{logits -> next_token_id}，与输入阶段的 \code{text -> token_ids} tokenization 不同。
+
+\subsection{\folder{spec_decode/}：推测解码}
+
+该目录支持 Eagle、Medusa、N-gram、DFlash、DSpark、draft model 和 suffix proposer 等推测解码方案。其目标是先提出多个 draft tokens，再由主模型进行验证，从而提升 Decode 吞吐。
+
+\subsection{\folder{device/}：设备抽象}
+
+负责 Ascend NPU 的设备操作、公共设备工具和 MXFP 类型兼容。
+
+\subsection{\folder{device_allocator/}：显存分配}
+
+负责 CaMem allocator、sleep mode 显存优化以及权重和 KV Cache 内存池管理。
+
+\subsection{\folder{model_executor/}：模型执行辅助能力}
+
+当前主要包含 \folder{offloader/}，用于模型权重 offload、权重预取和 CPU/NPU 之间的模块迁移。
+
+\subsection{\folder{model_loader/}：模型加载扩展}
+
+包含两类额外加载方式：
+
+\begin{itemize}
+  \item \folder{netloader/}：通过网络加载或传输权重；
+  \item \folder{rfork/}：基于 rfork 的模型和进程加载方案。
+\end{itemize}
+
+\subsection{\folder{kv_offload/} 与 \folder{simple_kv_offload/}}
+
+\folder{kv_offload/} 管理 KV Cache 在 CPU 和 NPU 之间的迁移。\folder{simple_kv_offload/} 则适配上游的简单 CPU KV Offload 接口，包含 NPU 内存操作、copy backend 和专用 Worker。两者面向的接入接口和实现路径不同。
+
+\subsection{\folder{eplb/}：专家负载均衡}
+
+EPLB 即 Expert Parallel Load Balancing。该目录负责统计 MoE 专家访问热度、更新专家映射，并在多卡之间平衡专家负载。
+
+\subsection{\folder{lora/}：LoRA 适配}
+
+包含 LoRA 算子、Punica NPU 实现、MoE LoRA 以及 LoRA 张量和索引管理。
+
+\subsection{\folder{profiler/}：性能分析}
+
+集成 Ascend profiler，用于收集 NPU 算子耗时、模型阶段耗时、内存占用和执行性能数据。
+
+\subsection{\folder{_310p/}：Ascend 310P 专用实现}
+
+Ascend 310P 与 910 系列能力存在差异，因此单独维护 Worker、ModelRunner、Attention、采样、MoE、量化和 KV Cache 管理实现。
+
+\subsection{\folder{xlite/}：Xlite 运行时适配}
+
+该目录将 vLLM 模型和权重转换为 Xlite 原生运行时可以识别的形式，提供 \code{XliteWorker}、\code{XliteModelRunner}、模型包装器、KV Cache 注册和 Xlite Graph 执行。这是普通 NPUModelRunner 之外的一条可选执行路径。
+
+\subsection{\folder{_cann_ops_custom/}：自定义算子预留目录}
+
+当前目录中只有 \folder{.gitkeep}，没有实际 Python 逻辑，通常作为构建或安装过程中生成 CANN 自定义算子内容的预留位置。
+
+\section{底层算子：\folder{csrc/}}
+
+\folder{csrc/} 保存 C++、AscendC 和 CANN 扩展代码。
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.31\textwidth} >{\raggedright\arraybackslash}p{0.61\textwidth}}
+\toprule
+\textbf{子目录} & \textbf{功能} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{子目录} & \textbf{功能} \\
+\midrule
+\endhead
+\folder{aclnn_torch_adapter/} & CANN/ACLNN 与 PyTorch Tensor 之间的桥接。 \\
+\folder{attention/} & 底层 Attention Kernel。 \\
+\folder{batch_matmul_transpose/} & Batch MatMul 和 Transpose 融合算子。 \\
+\folder{gmm/} & Grouped MatMul，主要服务于 MoE。 \\
+\folder{kernels/} & BGMV、SGMV 等通用 Kernel。 \\
+\folder{mc2/} & 计算与通信融合，主要用于 MoE 和分布式执行。 \\
+\folder{mla_preprocess/} & MLA 前处理算子。 \\
+\folder{moe/} & MoE 专用融合算子。 \\
+\folder{common/}、\folder{utils/} & Tensor、CANN、通信和错误处理公共工具。 \\
+\folder{cmake/} & 自定义算子的构建逻辑。 \\
+\folder{scripts/} & 算子生成和构建辅助脚本。 \\
+\folder{third_party/} & 第三方源码或依赖预留位置。 \\
+\bottomrule
+\end{longtable}
+
+Python 层 \folder{vllm_ascend/ops/} 通常会调用这里编译生成的扩展算子。
+
+\section{测试、示例和开发工具}
+
+\subsection{\folder{tests/}}
+
+\begin{itemize}
+  \item \folder{tests/ut/}：单元测试，基本按 \folder{vllm_ascend/} 模块划分；
+  \item \folder{tests/e2e/}：端到端推理测试；
+  \item \folder{pull_request/}：面向 Pull Request 的基础测试；
+  \item \folder{nightly/}：每日完整或硬件相关测试；
+  \item \folder{weekly/}：大模型、多节点和低频测试。
+\end{itemize}
+
+\subsection{\folder{examples/}}
+
+示例主题包括聊天模板、模型量化、Prefill/Decode 分离、Encoder 解耦、在线 Data Parallel、动态负载均衡、EPLB、rfork 和强化学习集成。示例代码不是在线服务的生产主路径。
+
+\subsection{\folder{benchmarks/}}
+
+用于测量在线吞吐、请求延迟、Serving 性能和算子性能。\folder{tests/*.json} 保存不同性能测试场景的配置。
+
+\subsection{\folder{tools/}}
+
+提供请求发送、Benchmark、自动回归定位、文档生成、代码格式和静态检查工具。代表性文件包括 \folder{send_request.py}、\folder{vllm_bench.py}、\folder{aisbench.py}、\folder{bisect/} 和 \folder{docs_codegen/}。
+
+\section{项目主执行流程}
+
+\begin{lstlisting}
+Upstream vLLM CLI / API server
+        |
+load vllm-ascend plugin
+        |
+NPUPlatform configuration
+        |
+NPUWorker.init_device()
+        |
+load model + allocate KV cache + warm up
+        |
+SchedulerOutput from upstream vLLM
+        |
+NPUWorker.execute_model()
+        |
+NPUModelRunner.execute_model()
+        |
+Ascend attention / custom operators
+        |
+logits -> AscendSampler -> next token IDs
+        |
+upstream output processor / detokenizer
+\end{lstlisting}
+
+推荐按照以下顺序阅读源码：
+
+\begin{enumerate}
+  \item \folder{setup.py}：了解插件注册；
+  \item \folder{vllm_ascend/__init__.py}：了解插件入口和全局 patch；
+  \item \folder{vllm_ascend/platform.py}：了解平台和运行配置；
+  \item \folder{vllm_ascend/worker/worker.py}：了解 Worker 生命周期；
+  \item \folder{vllm_ascend/worker/model_runner_v1.py}：了解每轮推理执行；
+  \item \folder{vllm_ascend/attention/} 和 \folder{vllm_ascend/ops/}：了解 NPU 计算实现；
+  \item \folder{csrc/}：进一步分析底层融合算子。
+\end{enumerate}
+
+\section{与 LoPT 并行 Tokenization 的关系}
+
+当前项目没有正式的生产 tokenization 目录。上游完整请求链路是：
+
+\begin{lstlisting}
+HTTP request
+    |
+chat template / renderer
+    |
+tokenizer.encode()       <- LoPT candidate location
+    |
+prompt_token_ids
+    |
+AsyncLLM / EngineCore / Scheduler
+    |
+vllm-ascend NPU execution
+\end{lstlisting}
+
+如果将 LoPT 原型放入当前仓库，建议采用如下结构：
+
+\begin{lstlisting}
+vllm_ascend/
+  tokenization/
+    __init__.py
+    lopt_tokenizer.py
+  patch/platform/
+    patch_lopt_tokenization.py
+
+tests/ut/
+  tokenization/
+    test_lopt_tokenizer.py
+\end{lstlisting}
+
+其中 \folder{tokenization/} 实现文本分片、overlap、并行调用原 tokenizer 以及边界匹配合并；\folder{patch/platform/} 只负责把它接入上游 vLLM Renderer/tokenizer 调用点。
+
+通常不应为 LoPT 修改以下目录：
+
+\begin{itemize}
+  \item \folder{worker/}；
+  \item \folder{attention/}；
+  \item \folder{ops/}；
+  \item \folder{sample/}；
+  \item \folder{csrc/}。
+\end{itemize}
+
+原因是请求进入这些目录时，原始文本已经被转换为 token IDs，无法再执行基于文本分片边界的 overlap 和匹配合并。
+
+\section{总结}
+
+\folder{vllm-ascend} 的核心职责是完成从上游 Scheduler 生成 token 计算任务，到 Ascend NPU 执行模型并返回新 token IDs 的过程。项目的主运行逻辑集中在 \folder{platform.py}、\folder{worker/}、\folder{attention/}、\folder{ops/} 和 \folder{csrc/}；文档、测试、示例和工具目录则服务于开发、验证和交付。
+
+LoPT 并行 tokenization 位于更靠前的 CPU 请求预处理阶段。当前仓库没有原生 tokenization 主流程，可以通过 patch 机制进行原型接入，但通用实现最终更适合进入上游 vLLM。
+
+\end{document}
