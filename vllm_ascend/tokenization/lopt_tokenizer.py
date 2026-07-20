@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from bisect import bisect_left
 from collections import defaultdict
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -234,6 +235,13 @@ def _in_overlap(record: tuple[int, int, int], overlap_start: int, overlap_end: i
     return end > start and start >= overlap_start and end <= overlap_end
 
 
+def _overlap_token_range(encoding: ChunkEncoding, overlap_start: int, overlap_end: int) -> range:
+    """Return token indices whose starts may fall within the overlap."""
+    first = bisect_left(encoding.global_offsets, (overlap_start, overlap_start))
+    stop = bisect_left(encoding.global_offsets, (overlap_end, overlap_end), lo=first)
+    return range(first, stop)
+
+
 def _find_position_overlap(
     left: ChunkEncoding,
     right: ChunkEncoding,
@@ -245,13 +253,13 @@ def _find_position_overlap(
         return None
 
     right_candidates: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-    for right_index in range(len(right.token_ids)):
+    for right_index in _overlap_token_range(right, overlap_start, overlap_end):
         record = _record(right, right_index)
         if _in_overlap(record, overlap_start, overlap_end):
             right_candidates[record].append(right_index)
 
     matches: list[OverlapMatch] = []
-    for left_index in range(len(left.token_ids)):
+    for left_index in _overlap_token_range(left, overlap_start, overlap_end):
         first_record = _record(left, left_index)
         if not _in_overlap(first_record, overlap_start, overlap_end):
             continue

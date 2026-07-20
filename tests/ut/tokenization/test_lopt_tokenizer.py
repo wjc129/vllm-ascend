@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+import vllm_ascend.tokenization.lopt_tokenizer as lopt_tokenizer_module
 from vllm_ascend.tokenization.lopt_tokenizer import (
     ChunkEncoding,
     LoptConfig,
@@ -220,6 +221,46 @@ def test_position_match_supports_multiple_byte_tokens_with_the_same_character_of
 
     assert match is not None
     assert (match.left_start, match.right_start, match.token_count) == (1, 0, 3)
+
+
+def test_position_match_does_not_scan_tokens_before_overlap(monkeypatch):
+    left_token_count = 1_000
+    overlap_start = 997
+    right_token_count = 6
+    left = ChunkEncoding(
+        index=0,
+        global_start=0,
+        global_end=left_token_count,
+        token_ids=tuple(range(left_token_count)),
+        local_offsets=tuple((index, index + 1) for index in range(left_token_count)),
+        global_offsets=tuple((index, index + 1) for index in range(left_token_count)),
+    )
+    right = ChunkEncoding(
+        index=1,
+        global_start=overlap_start,
+        global_end=overlap_start + right_token_count,
+        token_ids=tuple(range(overlap_start, overlap_start + right_token_count)),
+        local_offsets=tuple((index, index + 1) for index in range(right_token_count)),
+        global_offsets=tuple(
+            (index, index + 1) for index in range(overlap_start, overlap_start + right_token_count)
+        ),
+    )
+    original_record = lopt_tokenizer_module._record
+    visited_left_indices: list[int] = []
+
+    def tracking_record(encoding: ChunkEncoding, index: int) -> tuple[int, int, int]:
+        if encoding is left:
+            visited_left_indices.append(index)
+        return original_record(encoding, index)
+
+    monkeypatch.setattr(lopt_tokenizer_module, "_record", tracking_record)
+
+    match = _find_position_overlap(left, right, min_match_tokens=2)
+
+    assert match is not None
+    assert (match.left_start, match.right_start, match.token_count) == (overlap_start, 0, 3)
+    assert visited_left_indices
+    assert min(visited_left_indices) >= overlap_start
 
 
 def test_lossless_merge_matches_standard_tokenization_for_unicode_and_repetition():
