@@ -35,6 +35,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
 
 ESCAPED_ARGUMENTS_PARAM_NAME = "__vllm_param_arguments__"
@@ -350,11 +351,22 @@ def _patched_extract_tool_calls(
     if self.tool_call_start_token not in model_output:
         return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
+    first_tool_idx = model_output.find(self.tool_call_start_token)
+    content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
+
     try:
         _ensure_parser_regexes(self)
         tool_calls = []
-        for tool_call_match in self.tool_call_complete_regex.findall(model_output):
-            for invoke_name, invoke_content in self.invoke_complete_regex.findall(tool_call_match):
+        block_start = first_tool_idx
+        while block_start != -1:
+            payload_start = block_start + len(self.tool_call_start_token)
+            block_end = model_output.find(self.tool_call_end_token, payload_start)
+            if block_end == -1:
+                tool_call_payload = model_output[payload_start:]
+            else:
+                tool_call_payload = model_output[payload_start:block_end]
+
+            for invoke_name, invoke_content in self.invoke_complete_regex.findall(tool_call_payload):
                 params = _parse_invoke_params(self, invoke_content, request, invoke_name)
                 tool_calls.append(
                     ToolCall(
@@ -366,18 +378,23 @@ def _patched_extract_tool_calls(
                     )
                 )
 
-        if not tool_calls:
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+            if block_end == -1:
+                break
+            block_start = model_output.find(
+                self.tool_call_start_token,
+                block_end + len(self.tool_call_end_token),
+            )
 
-        first_tool_idx = model_output.find(self.tool_call_start_token)
-        content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
+        if not tool_calls:
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=content)
+
         return ExtractedToolCallInformation(
             tools_called=True,
             tool_calls=tool_calls,
             content=content,
         )
     except Exception:
-        return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+        return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=content)
 
 
 def _reset_streaming_state(self: DeepSeekV4ToolParser) -> None:
@@ -446,6 +463,62 @@ def _pop_pending_delta_message(self: DeepSeekV4ToolParser) -> DeltaMessage | Non
 
     content = "".join(content_parts) or None
     return DeltaMessage(content=content, tool_calls=list(merged_tool_calls.values()))
+
+
+def _merge_delta_messages(
+    first: DeltaMessage | None,
+    second: DeltaMessage | None,
+) -> DeltaMessage | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+
+    content = None
+    if first.content is not None or second.content is not None:
+        content = (first.content or "") + (second.content or "")
+
+    reasoning = None
+    if first.reasoning is not None or second.reasoning is not None:
+        reasoning = (first.reasoning or "") + (second.reasoning or "")
+
+    merged_tool_calls: dict[int, DeltaToolCall] = {}
+    for message in (first, second):
+        for tool_call in message.tool_calls or []:
+            index = tool_call.index
+            function = tool_call.function
+            if index not in merged_tool_calls:
+                merged_tool_calls[index] = DeltaToolCall(
+                    index=index,
+                    id=tool_call.id,
+                    type=tool_call.type,
+                    function=DeltaFunctionCall(
+                        name=function.name if function else None,
+                        arguments=function.arguments if function else None,
+                    ),
+                )
+                continue
+
+            merged = merged_tool_calls[index]
+            if tool_call.id is not None:
+                merged.id = tool_call.id
+            if tool_call.type is not None:
+                merged.type = tool_call.type
+            if function is None:
+                continue
+            if merged.function is None:
+                merged.function = DeltaFunctionCall()
+            if function.name is not None:
+                merged.function.name = function.name
+            if function.arguments is not None:
+                merged.function.arguments = (merged.function.arguments or "") + function.arguments
+
+    return DeltaMessage(
+        role=second.role or first.role,
+        content=content,
+        reasoning=reasoning,
+        tool_calls=list(merged_tool_calls.values()),
+    )
 
 
 def _queue_delta_message(self: DeepSeekV4ToolParser, message: DeltaMessage | None) -> None:
@@ -742,6 +815,50 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
         self._streaming_param_mode = "string" if is_string else "json"
 
 
+def _finish_streaming(
+    self: DeepSeekV4ToolParser,
+    request: ChatCompletionRequest | None = None,
+) -> DeltaMessage | None:
+    _ensure_streaming_attrs(self)
+    _process_streaming_buffer(self, request)
+    pending_delta = _pop_pending_delta_message(self)
+
+    if not self._in_tool_calls:
+        if self._buffer:
+            pending_delta = _merge_delta_messages(
+                pending_delta,
+                DeltaMessage(content=self._buffer),
+            )
+            self._buffer = ""
+        return pending_delta
+
+    # Anything left in the buffer belongs to an unfinished DSML structure.
+    # It must never be exposed as ordinary response content.
+    self._buffer = ""
+
+    active_index = self._active_tool_index
+    if active_index is not None:
+        # Do not force-close an incomplete invoke or parameter. Remove its
+        # bookkeeping so DelegatingParser cannot append a fabricated `{}`.
+        for values in (
+            self.prev_tool_call_arr,
+            self.streamed_args_for_tool,
+            self._args_started,
+        ):
+            if active_index < len(values):
+                del values[active_index:]
+        self.current_tool_index = active_index
+
+    self._streaming_param_mode = None
+    self._streaming_param_key = None
+    self._streaming_param_raw_parts.clear()
+    self._active_tool_index = None
+    self._active_tool_name = None
+    self._in_tool_calls = False
+
+    return pending_delta
+
+
 def _patched_extract_tool_calls_streaming(
     self: DeepSeekV4ToolParser,
     previous_text: str,
@@ -767,6 +884,47 @@ def _patched_extract_tool_calls_streaming(
         return DeltaMessage(content="")
 
     return None
+
+
+_original_delegating_parse_delta = DelegatingParser.parse_delta
+
+
+def _patched_delegating_parse_delta(
+    self: DelegatingParser,
+    delta_text: str,
+    delta_token_ids: list[int],
+    request: Any,
+    prompt_token_ids: list[int] | None = None,
+    *,
+    finished: bool,
+) -> DeltaMessage | None:
+    tool_parser = getattr(self, "_tool_parser", None)
+    if not finished or not isinstance(tool_parser, DeepSeekV4ToolParser):
+        return _original_delegating_parse_delta(
+            self,
+            delta_text,
+            delta_token_ids,
+            request,
+            prompt_token_ids,
+            finished=finished,
+        )
+
+    delta_message = _original_delegating_parse_delta(
+        self,
+        delta_text,
+        delta_token_ids,
+        request,
+        prompt_token_ids,
+        finished=False,
+    )
+    finish_delta = tool_parser.finish_streaming(request)
+    delta_message = _merge_delta_messages(delta_message, finish_delta)
+
+    try:
+        self._append_unstreamed_tool_args(delta_message)
+        return delta_message
+    finally:
+        tool_parser._reset_streaming_state()
 
 
 # Backward-compatible monkey patches.
@@ -799,4 +957,6 @@ DeepSeekV4ToolParser._finish_buffered_wrapper_param = _finish_buffered_wrapper_p
 DeepSeekV4ToolParser._close_streaming_tool_call = _close_streaming_tool_call
 DeepSeekV4ToolParser._safe_content_len_before_tag_end = _safe_content_len_before_tag_end
 DeepSeekV4ToolParser._process_streaming_buffer = _process_streaming_buffer
+DeepSeekV4ToolParser.finish_streaming = _finish_streaming
 DeepSeekV4ToolParser.extract_tool_calls_streaming = _patched_extract_tool_calls_streaming
+DelegatingParser.parse_delta = _patched_delegating_parse_delta
