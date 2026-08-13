@@ -899,6 +899,19 @@ def _patched_delegating_parse_delta(
     finished: bool,
 ) -> DeltaMessage | None:
     tool_parser = getattr(self, "_tool_parser", None)
+
+    # DelegatingParser gates tool parsing on ``state.reasoning_ended``.
+    # Upstream normally initializes that flag while checking prompt token
+    # IDs, but those IDs may be absent from a streaming output.  Without a
+    # reasoning parser there is no reasoning phase to wait for, so enter the
+    # tool phase immediately.  Otherwise every delta bypasses the tool parser
+    # and raw DSML is emitted through ``DeltaMessage.content``.
+    if (
+        isinstance(tool_parser, DeepSeekV4ToolParser)
+        and getattr(self, "_reasoning_parser", None) is None
+    ):
+        self._stream_state.reasoning_ended = True
+
     if not finished or not isinstance(tool_parser, DeepSeekV4ToolParser):
         return _original_delegating_parse_delta(
             self,
