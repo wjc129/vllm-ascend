@@ -561,6 +561,65 @@ def test_streaming_without_reasoning_or_prompt_ids_never_returns_raw_dsml_conten
         assert not tool_parser._in_tool_calls
 
 
+def test_configured_reasoning_parser_does_not_receive_split_dsml():
+    for tool_choice in (None, "auto"):
+        parser = DelegatingParser(MOCK_TOKENIZER)
+        reasoning_parser = MagicMock()
+        tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+        parser.reasoning_parser = reasoning_parser
+        parser.tool_parser = tool_parser
+        # Mirror the real combined parser: the DeepSeek V4 tool parser is not
+        # engine-based, so DelegatingParser retains text history across chunks.
+        parser._engine_based = False
+        parser._stream_state.engine_based = False
+        request = ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice=tool_choice,
+        )
+        model_output = (
+            f"{TC_START}\n"
+            f'{INV_START}plan_trip">\n'
+            f'{PARAM_START}notes" string="true">unfinished'
+        )
+
+        deltas = []
+        for char in model_output:
+            delta = parser.parse_delta(
+                char,
+                [1],
+                request,
+                prompt_token_ids=None,
+                finished=False,
+            )
+            if delta is not None:
+                deltas.append(delta)
+        terminal_delta = parser.parse_delta(
+            "",
+            [],
+            request,
+            prompt_token_ids=None,
+            finished=True,
+        )
+        if terminal_delta is not None:
+            deltas.append(terminal_delta)
+
+        content = "".join(delta.content or "" for delta in deltas)
+        arguments = "".join(
+            tool_call.function.arguments or ""
+            for delta in deltas
+            for tool_call in delta.tool_calls or []
+            if tool_call.function
+        )
+        assert content == ""
+        assert "<｜DSML｜" not in content
+        assert arguments == '{"notes":"unfinished'
+        reasoning_parser.extract_reasoning_streaming.assert_not_called()
+        assert tool_parser._buffer == ""
+        assert not tool_parser._in_tool_calls
+
+
 def test_registered_parser_is_patch_loaded():
     # Regression check that Ascend patch applies at import-time.
     assert (

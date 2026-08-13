@@ -899,27 +899,83 @@ def _patched_delegating_parse_delta(
     finished: bool,
 ) -> DeltaMessage | None:
     tool_parser = getattr(self, "_tool_parser", None)
+    prefix_delta = None
 
-    # DelegatingParser gates tool parsing on ``state.reasoning_ended``.
-    # Upstream normally initializes that flag while checking prompt token
-    # IDs, but those IDs may be absent from a streaming output.  Without a
-    # reasoning parser there is no reasoning phase to wait for, so enter the
-    # tool phase immediately.  Otherwise every delta bypasses the tool parser
-    # and raw DSML is emitted through ``DeltaMessage.content``.
-    if (
-        isinstance(tool_parser, DeepSeekV4ToolParser)
-        and getattr(self, "_reasoning_parser", None) is None
-    ):
-        self._stream_state.reasoning_ended = True
+    if isinstance(tool_parser, DeepSeekV4ToolParser):
+        state = self._stream_state
+        reasoning_parser = getattr(self, "_reasoning_parser", None)
+
+        # With no reasoning parser there is no reasoning phase to wait for.
+        if reasoning_parser is None:
+            state.reasoning_ended = True
+
+        # DeepSeek V4 servers normally configure both the reasoning parser and
+        # the tool parser.  A response may nevertheless start directly with a
+        # DSML tool call.  Hold back only a possible split start marker; once a
+        # complete marker is present, route it to the tool parser before the
+        # reasoning parser can expose it through ``delta.content``.
+        is_auto_tool_request = bool(getattr(request, "tools", None)) and getattr(
+            request, "tool_choice", None
+        ) in (None, "auto")
+        if reasoning_parser is not None and not state.reasoning_ended and is_auto_tool_request:
+            probe_text = getattr(self, "_deepseek_v4_dsml_probe_text", "") + delta_text
+            probe_token_ids = getattr(self, "_deepseek_v4_dsml_probe_token_ids", []) + list(
+                delta_token_ids
+            )
+            start_token = tool_parser.tool_call_start_token
+            start_idx = probe_text.find(start_token)
+
+            if start_idx == -1:
+                overlap = _partial_tag_overlap(probe_text, start_token)
+                if overlap and not finished:
+                    self._deepseek_v4_dsml_probe_text = probe_text
+                    self._deepseek_v4_dsml_probe_token_ids = probe_token_ids
+                    return None
+
+                # No DSML marker was found.  Flush ordinary text normally.  At
+                # EOS, discard only the suffix that is still an exact partial
+                # DSML marker, because it cannot be retracted after emission.
+                if overlap:
+                    probe_text = probe_text[:-overlap]
+                delta_text = probe_text
+                delta_token_ids = probe_token_ids
+            else:
+                text_before_dsml = probe_text[:start_idx]
+                if text_before_dsml:
+                    prefix_delta = _original_delegating_parse_delta(
+                        self,
+                        text_before_dsml,
+                        [],
+                        request,
+                        prompt_token_ids,
+                        finished=False,
+                    )
+
+                # The prefix has already gone through reasoning extraction.
+                # Start the tool phase with a clean text history so it receives
+                # the DSML marker exactly once.
+                state.previous_text = ""
+                state.previous_token_ids = []
+                state.reasoning_ended = True
+                state.prompt_reasoning_checked = True
+                state.tool_call_text_started = False
+                delta_text = probe_text[start_idx:]
+                delta_token_ids = probe_token_ids
+
+            self._deepseek_v4_dsml_probe_text = ""
+            self._deepseek_v4_dsml_probe_token_ids = []
 
     if not finished or not isinstance(tool_parser, DeepSeekV4ToolParser):
-        return _original_delegating_parse_delta(
-            self,
-            delta_text,
-            delta_token_ids,
-            request,
-            prompt_token_ids,
-            finished=finished,
+        return _merge_delta_messages(
+            prefix_delta,
+            _original_delegating_parse_delta(
+                self,
+                delta_text,
+                delta_token_ids,
+                request,
+                prompt_token_ids,
+                finished=finished,
+            ),
         )
 
     delta_message = _original_delegating_parse_delta(
@@ -930,6 +986,7 @@ def _patched_delegating_parse_delta(
         prompt_token_ids,
         finished=False,
     )
+    delta_message = _merge_delta_messages(prefix_delta, delta_message)
     finish_delta = tool_parser.finish_streaming(request)
     delta_message = _merge_delta_messages(delta_message, finish_delta)
 
@@ -937,6 +994,8 @@ def _patched_delegating_parse_delta(
         self._append_unstreamed_tool_args(delta_message)
         return delta_message
     finally:
+        self._deepseek_v4_dsml_probe_text = ""
+        self._deepseek_v4_dsml_probe_token_ids = []
         tool_parser._reset_streaming_state()
 
 
