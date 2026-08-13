@@ -709,7 +709,7 @@ def test_tool_choice_none_without_tools_preserves_plain_content():
         messages=[],
         tool_choice="none",
     )
-    model_output = "ordinary answer < not a DSML marker"
+    model_output = "ordinary answer containing DSML <"
     deltas = []
 
     for char in model_output:
@@ -734,6 +734,44 @@ def test_tool_choice_none_without_tools_preserves_plain_content():
 
     assert "".join(delta.content or "" for delta in deltas) == model_output
     assert not any(delta.tool_calls for delta in deltas)
+
+
+def test_terminal_partial_outer_dsml_start_is_discarded():
+    for prefix_len in range(2, len(TC_START)):
+        parser = DelegatingParser(MOCK_TOKENIZER)
+        tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+        parser.tool_parser = tool_parser
+        request = ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tool_choice="none",
+        )
+        deltas = []
+
+        for char in TC_START[:prefix_len]:
+            delta = parser.parse_delta(
+                char,
+                [1],
+                request,
+                prompt_token_ids=None,
+                finished=False,
+            )
+            if delta is not None:
+                deltas.append(delta)
+        terminal_delta = parser.parse_delta(
+            "",
+            [],
+            request,
+            prompt_token_ids=None,
+            finished=True,
+        )
+        if terminal_delta is not None:
+            deltas.append(terminal_delta)
+
+        content = "".join(delta.content or "" for delta in deltas)
+        assert content == ""
+        assert not any(delta.tool_calls for delta in deltas)
+        assert tool_parser._buffer == ""
 
 
 def test_registered_parser_is_patch_loaded():
