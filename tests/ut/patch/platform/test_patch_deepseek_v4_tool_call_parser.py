@@ -510,6 +510,57 @@ def test_terminal_parse_with_dsml_only_never_returns_raw_content():
     assert not tool_parser._in_tool_calls
 
 
+def test_streaming_without_reasoning_or_prompt_ids_never_returns_raw_dsml_content():
+    for tool_choice in (None, "auto"):
+        parser = DelegatingParser(MOCK_TOKENIZER)
+        tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+        parser.tool_parser = tool_parser
+        request = ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice=tool_choice,
+        )
+        model_output = (
+            f"{TC_START}\n"
+            f'{INV_START}plan_trip">\n'
+            f'{PARAM_START}notes" string="true">unfinished'
+        )
+
+        first_delta = parser.parse_delta(
+            model_output,
+            [1],
+            request,
+            prompt_token_ids=None,
+            finished=False,
+        )
+        terminal_delta = parser.parse_delta(
+            "",
+            [],
+            request,
+            prompt_token_ids=None,
+            finished=True,
+        )
+
+        content = "".join(
+            delta.content or ""
+            for delta in (first_delta, terminal_delta)
+            if delta is not None
+        )
+        arguments = "".join(
+            tool_call.function.arguments or ""
+            for delta in (first_delta, terminal_delta)
+            if delta is not None
+            for tool_call in delta.tool_calls or []
+            if tool_call.function
+        )
+        assert content == ""
+        assert "<｜DSML｜" not in content
+        assert arguments == '{"notes":"unfinished'
+        assert tool_parser._buffer == ""
+        assert not tool_parser._in_tool_calls
+
+
 def test_registered_parser_is_patch_loaded():
     # Regression check that Ascend patch applies at import-time.
     assert (
