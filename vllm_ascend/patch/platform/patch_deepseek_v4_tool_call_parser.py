@@ -1020,6 +1020,58 @@ def _patched_extract_tool_calls_streaming(
 _original_delegating_parse_delta = DelegatingParser.parse_delta
 
 
+def _request_suppresses_tool_calls(request: Any) -> bool:
+    return getattr(request, "tool_choice", None) == "none" or not bool(
+        getattr(request, "tools", None)
+    )
+
+
+def _discard_unrequested_tool_call_deltas(
+    delta_message: DeltaMessage | None,
+    *,
+    suppress_tool_calls: bool,
+) -> DeltaMessage | None:
+    if delta_message is not None and suppress_tool_calls:
+        delta_message.tool_calls = []
+    return delta_message
+
+
+def _call_original_delegating_parse_delta(
+    self: DelegatingParser,
+    delta_text: str,
+    delta_token_ids: list[int],
+    request: Any,
+    prompt_token_ids: list[int] | None,
+    *,
+    finished: bool,
+    suppress_tool_calls: bool,
+) -> DeltaMessage | None:
+    # Upstream treats ``tool_choice='none'`` as an instruction to bypass the
+    # tool parser and return delta_text verbatim.  DeepSeek V4 can still emit
+    # DSML in this situation.  Route through the parser as if auto parsing was
+    # selected, then remove every structured tool delta before returning.
+    original_tool_choice = getattr(request, "tool_choice", None)
+    if suppress_tool_calls:
+        request.tool_choice = None
+    try:
+        delta_message = _original_delegating_parse_delta(
+            self,
+            delta_text,
+            delta_token_ids,
+            request,
+            prompt_token_ids,
+            finished=finished,
+        )
+    finally:
+        if suppress_tool_calls:
+            request.tool_choice = original_tool_choice
+
+    return _discard_unrequested_tool_call_deltas(
+        delta_message,
+        suppress_tool_calls=suppress_tool_calls,
+    )
+
+
 def _patched_delegating_parse_delta(
     self: DelegatingParser,
     delta_text: str,
@@ -1032,6 +1084,9 @@ def _patched_delegating_parse_delta(
     tool_parser = getattr(self, "_tool_parser", None)
     prefix_delta = None
     state = self._stream_state
+    suppress_tool_calls = isinstance(
+        tool_parser, DeepSeekV4ToolParser
+    ) and _request_suppresses_tool_calls(request)
 
     if isinstance(tool_parser, DeepSeekV4ToolParser) and not getattr(
         self, "_deepseek_v4_debug_stream_announced", False
@@ -1044,6 +1099,7 @@ def _patched_delegating_parse_delta(
             reasoning_parser_type=_parser_type(getattr(self, "_reasoning_parser", None)),
             tool_choice=getattr(request, "tool_choice", None),
             has_tools=bool(getattr(request, "tools", None)),
+            suppress_tool_calls=suppress_tool_calls,
             prompt_token_ids_is_none=prompt_token_ids is None,
             reasoning_ended=state.reasoning_ended,
             engine_based=getattr(state, "engine_based", None),
@@ -1074,7 +1130,8 @@ def _patched_delegating_parse_delta(
         is_auto_tool_request = bool(getattr(request, "tools", None)) and getattr(
             request, "tool_choice", None
         ) in (None, "auto")
-        if reasoning_parser is not None and not state.reasoning_ended and is_auto_tool_request:
+        should_probe_for_dsml = is_auto_tool_request or suppress_tool_calls
+        if reasoning_parser is not None and not state.reasoning_ended and should_probe_for_dsml:
             probe_text = getattr(self, "_deepseek_v4_dsml_probe_text", "") + delta_text
             probe_token_ids = getattr(self, "_deepseek_v4_dsml_probe_token_ids", []) + list(
                 delta_token_ids
@@ -1142,13 +1199,14 @@ def _patched_delegating_parse_delta(
     if not finished or not isinstance(tool_parser, DeepSeekV4ToolParser):
         delta_message = _merge_delta_messages(
             prefix_delta,
-            _original_delegating_parse_delta(
+            _call_original_delegating_parse_delta(
                 self,
                 delta_text,
                 delta_token_ids,
                 request,
                 prompt_token_ids,
                 finished=finished,
+                suppress_tool_calls=suppress_tool_calls,
             ),
         )
         _debug_delegating_output(self, delta_message, tool_parser)
@@ -1166,16 +1224,21 @@ def _patched_delegating_parse_delta(
             self._deepseek_v4_debug_content_leak_announced = False
         return delta_message
 
-    delta_message = _original_delegating_parse_delta(
+    delta_message = _call_original_delegating_parse_delta(
         self,
         delta_text,
         delta_token_ids,
         request,
         prompt_token_ids,
         finished=False,
+        suppress_tool_calls=suppress_tool_calls,
     )
     delta_message = _merge_delta_messages(prefix_delta, delta_message)
     finish_delta = tool_parser.finish_streaming(request)
+    finish_delta = _discard_unrequested_tool_call_deltas(
+        finish_delta,
+        suppress_tool_calls=suppress_tool_calls,
+    )
     delta_message = _merge_delta_messages(delta_message, finish_delta)
 
     try:
