@@ -620,6 +620,122 @@ def test_configured_reasoning_parser_does_not_receive_split_dsml():
         assert not tool_parser._in_tool_calls
 
 
+def test_unrequested_tool_calls_discard_dsml_without_content_leak():
+    request_cases = (
+        (None, "none"),
+        ([_tools()], "none"),
+        (None, "auto"),
+    )
+    model_outputs = (
+        (
+            f"{TC_START}\n"
+            f'{INV_START}read">\n'
+            f'{PARAM_START}filepath" string="true">unfinished'
+        ),
+        (
+            f"{TC_START}\n"
+            f'{INV_START}read">\n'
+            f'{PARAM_START}filepath" string="true">complete{PARAM_END}\n'
+            f"{INV_END}\n{TC_END}"
+        ),
+    )
+
+    for tools, tool_choice in request_cases:
+        for model_output in model_outputs:
+            chunk_sizes = (1, 7, len(model_output))
+            cases = (
+                (chunk_size, reasoning_ended)
+                for chunk_size in chunk_sizes
+                for reasoning_ended in (False, True)
+            )
+            for chunk_size, reasoning_ended in cases:
+                parser = DelegatingParser(MOCK_TOKENIZER)
+                reasoning_parser = MagicMock()
+                parser.reasoning_parser = reasoning_parser
+                tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+                parser.tool_parser = tool_parser
+                parser._engine_based = False
+                parser._stream_state.engine_based = False
+                parser._stream_state.reasoning_ended = reasoning_ended
+                request = ChatCompletionRequest(
+                    model="deepseek-ai/DeepSeek-V2-Chat",
+                    messages=[],
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+
+                deltas = []
+                for start in range(0, len(model_output), chunk_size):
+                    delta = parser.parse_delta(
+                        model_output[start : start + chunk_size],
+                        [1],
+                        request,
+                        prompt_token_ids=None,
+                        finished=False,
+                    )
+                    if delta is not None:
+                        deltas.append(delta)
+                terminal_delta = parser.parse_delta(
+                    "",
+                    [],
+                    request,
+                    prompt_token_ids=None,
+                    finished=True,
+                )
+                if terminal_delta is not None:
+                    deltas.append(terminal_delta)
+
+                content = "".join(delta.content or "" for delta in deltas)
+                tool_calls = [
+                    tool_call
+                    for delta in deltas
+                    for tool_call in delta.tool_calls or []
+                ]
+                assert content == ""
+                assert "<｜DSML｜" not in content
+                assert tool_calls == []
+                assert request.tool_choice == tool_choice
+                reasoning_parser.extract_reasoning_streaming.assert_not_called()
+                assert tool_parser._buffer == ""
+                assert not tool_parser._in_tool_calls
+
+
+def test_tool_choice_none_without_tools_preserves_plain_content():
+    parser = DelegatingParser(MOCK_TOKENIZER)
+    tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+    parser.tool_parser = tool_parser
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V2-Chat",
+        messages=[],
+        tool_choice="none",
+    )
+    model_output = "ordinary answer < not a DSML marker"
+    deltas = []
+
+    for char in model_output:
+        delta = parser.parse_delta(
+            char,
+            [1],
+            request,
+            prompt_token_ids=None,
+            finished=False,
+        )
+        if delta is not None:
+            deltas.append(delta)
+    terminal_delta = parser.parse_delta(
+        "",
+        [],
+        request,
+        prompt_token_ids=None,
+        finished=True,
+    )
+    if terminal_delta is not None:
+        deltas.append(terminal_delta)
+
+    assert "".join(delta.content or "" for delta in deltas) == model_output
+    assert not any(delta.tool_calls for delta in deltas)
+
+
 def test_registered_parser_is_patch_loaded():
     # Regression check that Ascend patch applies at import-time.
     assert (
