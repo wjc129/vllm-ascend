@@ -916,6 +916,19 @@ def _finish_streaming(
     pending_delta = _pop_pending_delta_message(self)
 
     if not self._in_tool_calls:
+        start_overlap = _partial_tag_overlap(self._buffer, self.tool_call_start_token)
+        if start_overlap == len(self._buffer) and start_overlap > 1:
+            # The model stopped after beginning the outer DSML marker but
+            # before completing ``<｜DSML｜tool_calls>``.  A lone ``<`` is still
+            # valid ordinary content and must be flushed; two or more exact
+            # marker-prefix characters are specific enough to discard safely.
+            _dsml_debug(
+                "tool-parser-finish-discarded-partial-start",
+                tool_parser_id=id(self),
+                partial_start_len=start_overlap,
+                partial_start_preview=_dsml_tag_preview(self._buffer),
+            )
+            self._buffer = ""
         if self._buffer:
             pending_delta = _merge_delta_messages(
                 pending_delta,
