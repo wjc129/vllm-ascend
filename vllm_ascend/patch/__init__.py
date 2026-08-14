@@ -328,8 +328,8 @@
 #       default when callers omit DeepSeek's thinking controls.
 #    How:
 #       Extend request pre-validation to fill a missing `thinking` object with
-#       `{"type": "enabled"}` and a missing `reasoning_effort` with `"high"`,
-#       without overriding caller-provided values.
+#       `{"type": "enabled"}` without adding a high-effort prompt or overriding
+#       caller-provided values.
 #    Related PR (if no, explain why):
 #       No, this is a deployment-specific default for the `dsv4` served name.
 #    Future Plan:

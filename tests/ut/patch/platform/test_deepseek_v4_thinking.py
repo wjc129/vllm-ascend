@@ -31,14 +31,14 @@ def test_dsv4_request_adds_thinking_defaults():
     params = request.build_chat_params(None, "auto")
 
     assert request.thinking == {"type": "enabled"}
-    assert request.reasoning_effort == "high"
+    assert request.reasoning_effort is None
     assert params.chat_template_kwargs["enable_thinking"] is True
 
 
 @pytest.mark.parametrize(
     ("provided_fields", "expected_thinking", "expected_reasoning_effort"),
     [
-        ({"thinking": {"type": "disabled"}}, {"type": "disabled"}, "high"),
+        ({"thinking": {"type": "disabled"}}, {"type": "disabled"}, None),
         ({"reasoning_effort": "low"}, {"type": "enabled"}, "low"),
         (
             {"thinking": None, "reasoning_effort": None},
@@ -111,6 +111,7 @@ def test_deepseek_v4_tokenizer_maps_latest_reasoning_effort_values(monkeypatch):
     tokenizer = deepseek_v4.get_deepseek_v4_tokenizer(FakeTokenizer())
 
     cases = [
+        (None, "thinking", None),
         ("none", "chat", None),
         ("minimal", "thinking", "high"),
         ("low", "thinking", "high"),

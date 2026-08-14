@@ -455,8 +455,9 @@ curl http://<node0_ip>:8900/v1/chat/completions \
     }'
 ```
 
-For requests with `"model": "dsv4"`, omitted `thinking` and `reasoning_effort` fields default to
-`{"type": "enabled"}` and `"high"`, respectively. Explicitly supplied values are preserved.
+For requests with `"model": "dsv4"`, an omitted `thinking` field defaults to
+`{"type": "enabled"}`. An omitted `reasoning_effort` remains unset, avoiding the
+additional high-effort prompt. Explicitly supplied values are preserved.
 
 Expected Result:
 
