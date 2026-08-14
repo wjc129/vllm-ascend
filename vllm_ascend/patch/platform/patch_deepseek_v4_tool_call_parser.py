@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
@@ -40,67 +39,6 @@ from vllm.parser.abstract_parser import DelegatingParser
 from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
 
 ESCAPED_ARGUMENTS_PARAM_NAME = "__vllm_param_arguments__"
-
-_DSML_DEBUG_ENABLED = os.getenv("VLLM_ASCEND_DSML_DEBUG", "1").lower() not in {
-    "0",
-    "false",
-    "off",
-}
-
-
-def _dsml_debug(event: str, **fields: Any) -> None:
-    if not _DSML_DEBUG_ENABLED:
-        return
-    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
-    print(f"[vllm-ascend DSML debug] {event} {details}".rstrip(), flush=True)
-
-
-def _parser_type(parser: Any) -> str | None:
-    if parser is None:
-        return None
-    parser_type = type(parser)
-    return f"{parser_type.__module__}.{parser_type.__qualname__}"
-
-
-def _dsml_tag_preview(text: str, limit: int = 240) -> str:
-    """Keep tag spelling visible without logging a complete parameter body."""
-    preview = text[:limit]
-    parameter_idx = preview.find("<｜DSML｜parameter")
-    if parameter_idx != -1:
-        tag_end = preview.find(">", parameter_idx)
-        if tag_end != -1:
-            preview = preview[: tag_end + 1] + "<parameter-body-redacted>"
-    return preview.replace("\r", "\\r").replace("\n", "\\n")
-
-
-def _debug_delegating_output(
-    parser: DelegatingParser,
-    delta_message: DeltaMessage | None,
-    tool_parser: Any,
-) -> None:
-    content = delta_message.content if delta_message is not None else None
-    if not content:
-        return
-
-    probe = getattr(parser, "_deepseek_v4_debug_returned_content_probe", "") + content
-    parser._deepseek_v4_debug_returned_content_probe = probe[-512:]
-    if ("DSML" in probe or "<｜" in probe) and not getattr(
-        parser, "_deepseek_v4_debug_content_leak_announced", False
-    ):
-        state = parser._stream_state
-        _dsml_debug(
-            "raw-dsml-returned-as-content",
-            delegating_parser_id=id(parser),
-            content_preview=_dsml_tag_preview(probe),
-            tool_parser_type=_parser_type(tool_parser),
-            reasoning_parser_type=_parser_type(getattr(parser, "_reasoning_parser", None)),
-            reasoning_ended=state.reasoning_ended,
-            tool_call_text_started=state.tool_call_text_started,
-        )
-        parser._deepseek_v4_debug_content_leak_announced = True
-
-
-_dsml_debug("patch-loaded", file=__file__)
 
 
 def _ensure_parser_regexes(self: DeepSeekV4ToolParser) -> None:
@@ -783,11 +721,6 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
 
             self._buffer = self._buffer[len(self.tool_call_start_token) :]
             self._in_tool_calls = True
-            _dsml_debug(
-                "tool-start-consumed",
-                tool_parser_id=id(self),
-                remaining_buffer_len=len(self._buffer),
-            )
             continue
 
         if self._active_tool_index is None:
@@ -806,12 +739,6 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
                 return
 
             self._buffer = self._buffer[match.end() :]
-            _dsml_debug(
-                "invoke-start-consumed",
-                tool_parser_id=id(self),
-                function_name=match.group(1),
-                remaining_buffer_len=len(self._buffer),
-            )
             self._begin_streaming_tool_call(match.group(1))
             continue
 
@@ -870,13 +797,6 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
         key = _extract_param_name(match.group(1))
         string_attr = match.group(2)
         is_string = string_attr == "true"
-        _dsml_debug(
-            "parameter-start-consumed",
-            tool_parser_id=id(self),
-            parameter_name=key,
-            string_attr=string_attr,
-            remaining_buffer_len=len(self._buffer),
-        )
         if _should_buffer_wrapper_param(self, key, request):
             self._streaming_param_key = key
             self._streaming_param_raw_parts.clear()
@@ -900,18 +820,6 @@ def _finish_streaming(
     request: ChatCompletionRequest | None = None,
 ) -> DeltaMessage | None:
     _ensure_streaming_attrs(self)
-    _dsml_debug(
-        "tool-parser-finish-enter",
-        tool_parser_id=id(self),
-        in_tool_calls=self._in_tool_calls,
-        active_tool_index=self._active_tool_index,
-        buffer_len=len(self._buffer),
-        buffer_preview=(
-            "<inside-tool-call-residue>"
-            if self._in_tool_calls
-            else _dsml_tag_preview(self._buffer)
-        ),
-    )
     _process_streaming_buffer(self, request)
     pending_delta = _pop_pending_delta_message(self)
 
@@ -922,12 +830,6 @@ def _finish_streaming(
             # before completing ``<｜DSML｜tool_calls>``.  A lone ``<`` is still
             # valid ordinary content and must be flushed; two or more exact
             # marker-prefix characters are specific enough to discard safely.
-            _dsml_debug(
-                "tool-parser-finish-discarded-partial-start",
-                tool_parser_id=id(self),
-                partial_start_len=start_overlap,
-                partial_start_preview=_dsml_tag_preview(self._buffer),
-            )
             self._buffer = ""
         if self._buffer:
             pending_delta = _merge_delta_messages(
@@ -961,12 +863,6 @@ def _finish_streaming(
     self._active_tool_name = None
     self._in_tool_calls = False
 
-    _dsml_debug(
-        "tool-parser-finish-discarded-incomplete-dsml",
-        tool_parser_id=id(self),
-        active_tool_index=active_index,
-    )
-
     return pending_delta
 
 
@@ -984,44 +880,11 @@ def _patched_extract_tool_calls_streaming(
     if not previous_text:
         self._reset_streaming_state()
 
-    debug_relevant = (
-        self._in_tool_calls
-        or "DSML" in delta_text
-        or "<｜" in delta_text
-        or bool(_partial_tag_overlap(delta_text, self.tool_call_start_token))
-    )
-    if debug_relevant:
-        _dsml_debug(
-            "tool-parser-input",
-            tool_parser_id=id(self),
-            previous_text_len=len(previous_text),
-            delta_len=len(delta_text),
-            delta_preview=(
-                _dsml_tag_preview(delta_text)
-                if not self._in_tool_calls
-                else "<inside-tool-call>"
-            ),
-            buffer_len_before=len(self._buffer),
-            in_tool_calls=self._in_tool_calls,
-        )
-
     self._buffer += delta_text
     _process_streaming_buffer(self, request)
 
     pending_delta = _pop_pending_delta_message(self)
     if pending_delta is not None:
-        content = pending_delta.content or ""
-        first_tool_call = (pending_delta.tool_calls or [None])[0]
-        function = first_tool_call.function if first_tool_call is not None else None
-        if content or (function is not None and function.name):
-            _dsml_debug(
-                "tool-parser-output",
-                tool_parser_id=id(self),
-                content_has_dsml="<｜DSML｜" in content,
-                content_preview=_dsml_tag_preview(content),
-                tool_call_count=len(pending_delta.tool_calls or []),
-                function_name=function.name if function is not None else None,
-            )
         return pending_delta
 
     if not delta_text and delta_token_ids and self.prev_tool_call_arr:
@@ -1101,33 +964,6 @@ def _patched_delegating_parse_delta(
         tool_parser, DeepSeekV4ToolParser
     ) and _request_suppresses_tool_calls(request)
 
-    if isinstance(tool_parser, DeepSeekV4ToolParser) and not getattr(
-        self, "_deepseek_v4_debug_stream_announced", False
-    ):
-        _dsml_debug(
-            "stream-start",
-            delegating_parser_id=id(self),
-            delegating_parser_type=_parser_type(self),
-            tool_parser_type=_parser_type(tool_parser),
-            reasoning_parser_type=_parser_type(getattr(self, "_reasoning_parser", None)),
-            tool_choice=getattr(request, "tool_choice", None),
-            has_tools=bool(getattr(request, "tools", None)),
-            suppress_tool_calls=suppress_tool_calls,
-            prompt_token_ids_is_none=prompt_token_ids is None,
-            reasoning_ended=state.reasoning_ended,
-            engine_based=getattr(state, "engine_based", None),
-        )
-        self._deepseek_v4_debug_stream_announced = True
-
-    raw_delta_has_dsml = "DSML" in delta_text or "<｜" in delta_text
-    if not isinstance(tool_parser, DeepSeekV4ToolParser) and raw_delta_has_dsml:
-        _dsml_debug(
-            "deepseek-v4-parser-type-check-failed",
-            delegating_parser_id=id(self),
-            actual_tool_parser_type=_parser_type(tool_parser),
-            delta_preview=_dsml_tag_preview(delta_text),
-        )
-
     if isinstance(tool_parser, DeepSeekV4ToolParser):
         reasoning_parser = getattr(self, "_reasoning_parser", None)
 
@@ -1155,15 +991,6 @@ def _patched_delegating_parse_delta(
             if start_idx == -1:
                 overlap = _partial_tag_overlap(probe_text, start_token)
                 if overlap and not finished:
-                    if not getattr(self, "_deepseek_v4_debug_probe_announced", False):
-                        _dsml_debug(
-                            "holding-possible-split-start",
-                            delegating_parser_id=id(self),
-                            overlap=overlap,
-                            probe_preview=_dsml_tag_preview(probe_text),
-                            reasoning_ended=state.reasoning_ended,
-                        )
-                        self._deepseek_v4_debug_probe_announced = True
                     self._deepseek_v4_dsml_probe_text = probe_text
                     self._deepseek_v4_dsml_probe_token_ids = probe_token_ids
                     return None
@@ -1176,13 +1003,6 @@ def _patched_delegating_parse_delta(
                 delta_text = probe_text
                 delta_token_ids = probe_token_ids
             else:
-                _dsml_debug(
-                    "complete-start-detected-before-reasoning",
-                    delegating_parser_id=id(self),
-                    start_idx=start_idx,
-                    probe_preview=_dsml_tag_preview(probe_text),
-                    reasoning_parser_type=_parser_type(reasoning_parser),
-                )
                 text_before_dsml = probe_text[:start_idx]
                 if text_before_dsml:
                     prefix_delta = _original_delegating_parse_delta(
@@ -1207,7 +1027,6 @@ def _patched_delegating_parse_delta(
 
             self._deepseek_v4_dsml_probe_text = ""
             self._deepseek_v4_dsml_probe_token_ids = []
-            self._deepseek_v4_debug_probe_announced = False
 
     if not finished or not isinstance(tool_parser, DeepSeekV4ToolParser):
         delta_message = _merge_delta_messages(
@@ -1222,19 +1041,6 @@ def _patched_delegating_parse_delta(
                 suppress_tool_calls=suppress_tool_calls,
             ),
         )
-        _debug_delegating_output(self, delta_message, tool_parser)
-        returned_content = delta_message.content if delta_message is not None else None
-        if finished:
-            _dsml_debug(
-                "stream-finished-non-deepseek-path",
-                delegating_parser_id=id(self),
-                returned_content_has_dsml=bool(
-                    returned_content and "<｜DSML｜" in returned_content
-                ),
-            )
-            self._deepseek_v4_debug_stream_announced = False
-            self._deepseek_v4_debug_returned_content_probe = ""
-            self._deepseek_v4_debug_content_leak_announced = False
         return delta_message
 
     delta_message = _call_original_delegating_parse_delta(
@@ -1256,27 +1062,10 @@ def _patched_delegating_parse_delta(
 
     try:
         self._append_unstreamed_tool_args(delta_message)
-        _debug_delegating_output(self, delta_message, tool_parser)
-        returned_content = delta_message.content if delta_message is not None else None
-        _dsml_debug(
-            "stream-finished-deepseek-path",
-            delegating_parser_id=id(self),
-            returned_content_has_dsml=bool(
-                returned_content and "<｜DSML｜" in returned_content
-            ),
-            returned_content_preview=_dsml_tag_preview(returned_content or ""),
-            returned_tool_call_count=len(delta_message.tool_calls or [])
-            if delta_message is not None
-            else 0,
-        )
         return delta_message
     finally:
         self._deepseek_v4_dsml_probe_text = ""
         self._deepseek_v4_dsml_probe_token_ids = []
-        self._deepseek_v4_debug_probe_announced = False
-        self._deepseek_v4_debug_stream_announced = False
-        self._deepseek_v4_debug_returned_content_probe = ""
-        self._deepseek_v4_debug_content_leak_announced = False
         tool_parser._reset_streaming_state()
 
 
@@ -1313,8 +1102,3 @@ DeepSeekV4ToolParser._process_streaming_buffer = _process_streaming_buffer
 DeepSeekV4ToolParser.finish_streaming = _finish_streaming
 DeepSeekV4ToolParser.extract_tool_calls_streaming = _patched_extract_tool_calls_streaming
 DelegatingParser.parse_delta = _patched_delegating_parse_delta
-_dsml_debug(
-    "patch-installed",
-    delegating_parse_delta_module=DelegatingParser.parse_delta.__module__,
-    delegating_parse_delta_name=DelegatingParser.parse_delta.__name__,
-)
