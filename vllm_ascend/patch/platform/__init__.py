@@ -32,7 +32,6 @@ if not is_310p():
     import vllm_ascend.patch.platform.patch_mamba_config  # noqa
 else:
     import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
-import vllm_ascend.patch.platform.patch_deepseek_v4_request_defaults  # noqa
 import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
 import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 
