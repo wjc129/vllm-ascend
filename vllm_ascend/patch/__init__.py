@@ -320,23 +320,7 @@
 #       Remove this patch if upstream streaming behavior is updated to satisfy the
 #       same DeepSeek DSML incrementality contract.
 #
-# ** 12a. File: platform/patch_deepseek_v4_request_defaults.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest`
-#    Why:
-#       Requests for the served model name `dsv4` should use thinking mode by
-#       default when callers omit DeepSeek's thinking controls.
-#    How:
-#       Extend request pre-validation to fill a missing `thinking` object with
-#       `{"type": "enabled"}` and a missing `reasoning_effort` with `"high"`,
-#       without overriding caller-provided values.
-#    Related PR (if no, explain why):
-#       No, this is a deployment-specific default for the `dsv4` served name.
-#    Future Plan:
-#       Remove this patch when the default is configurable through a stable vLLM
-#       request-default hook.
-#
-# ** 12b. File: platform/patch_minimax_m2_tool_call_parser.py**
+# ** 12a. File: platform/patch_minimax_m2_tool_call_parser.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.tool_parsers.minimax_m2_tool_parser.MinimaxM2ToolParser`
 #    Why:
@@ -353,6 +337,21 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains the upstream
 #       MiniMax-M2 incremental tool-call streaming fix.
+#
+# ** 12b. File: platform/patch_deepseek_v4_thinking_defaults.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.renderers.deepseek_v4.DeepseekV4Renderer`
+#   2. `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat`
+#    Why:
+#       Renderer-local defaults are applied after the response reasoning parser
+#       is created, so the parser cannot observe that thinking was enabled.
+#    How:
+#       Default missing `reasoning_effort` to `"high"` and enable thinking in
+#       the effective chat-template kwargs shared by rendering and parsing.
+#    Related PR (if no, explain why):
+#       No; this is a deployment-specific default.
+#    Future Plan:
+#       Remove when vLLM supports renderer and parser defaults from one source.
 #
 # ** 13. File: platform/patch_camem_allocator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

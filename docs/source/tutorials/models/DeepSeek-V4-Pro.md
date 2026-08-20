@@ -455,8 +455,8 @@ curl http://<node0_ip>:8900/v1/chat/completions \
     }'
 ```
 
-For requests with `"model": "dsv4"`, omitted `thinking` and `reasoning_effort` fields default to
-`{"type": "enabled"}` and `"high"`, respectively. Explicitly supplied values are preserved.
+DeepSeek V4 defaults to `reasoning_effort="high"` with thinking enabled, regardless
+of the served model name. Explicit non-null controls take precedence.
 
 Expected Result:
 
