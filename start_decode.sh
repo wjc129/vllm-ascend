@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-${SCRIPT_DIR}}"
-MODEL_PATH="${MODEL_PATH:-/data/models/deepseekmtp}"
+MODEL_PATH="${MODEL_PATH:-/data/models/DeepSeek-V4-Flash-w8a8-mtp}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv4}"
 NIC_NAME="${NIC_NAME:-enp23s0f3}"
 DECODE_NODE_IP="${DECODE_NODE_IP:-7.150.1.10}"
