@@ -3,10 +3,10 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-${SCRIPT_DIR}}"
-MODEL_PATH="${MODEL_PATH:-/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Flash-w8a8-mtp}"
+MODEL_PATH="${MODEL_PATH:-/data/models/deepseekmtp}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv4}"
 NIC_NAME="${NIC_NAME:-}"
-DECODE_NODE_IP="${DECODE_NODE_IP:-}"
+DECODE_NODE_IP="${DECODE_NODE_IP:-7.150.1.10}"
 DECODE_START_PORT="${DECODE_START_PORT:-7100}"
 DECODE_DP_RPC_PORT="${DECODE_DP_RPC_PORT:-12321}"
 DECODE_KV_PORT="${DECODE_KV_PORT:-36100}"
@@ -28,7 +28,13 @@ detect_local_ip() {
 }
 
 detect_nic() {
-    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+    local node_ip="$1"
+    local detected_nic
+    detected_nic="$(ip -o -4 addr show 2>/dev/null | awk -v target="${node_ip}" '{split($4, address, "/"); if (address[1] == target) {print $2; exit}}')"
+    if [[ -z "${detected_nic}" ]]; then
+        detected_nic="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+    fi
+    printf '%s' "${detected_nic}"
 }
 
 activate_runtime() {
@@ -43,7 +49,7 @@ activate_runtime() {
 
 activate_runtime
 DECODE_NODE_IP="${DECODE_NODE_IP:-$(detect_local_ip)}"
-NIC_NAME="${NIC_NAME:-$(detect_nic)}"
+NIC_NAME="${NIC_NAME:-$(detect_nic "${DECODE_NODE_IP}")}"
 : "${DECODE_NODE_IP:?Set DECODE_NODE_IP to the decode service IP}"
 : "${NIC_NAME:?Set NIC_NAME to the HCCL/GLOO service interface}"
 
