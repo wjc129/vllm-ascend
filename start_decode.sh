@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-${SCRIPT_DIR}}"
 MODEL_PATH="${MODEL_PATH:-/data/models/deepseekmtp}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv4}"
-NIC_NAME="${NIC_NAME:-}"
+NIC_NAME="${NIC_NAME:-enp23s0f3}"
 DECODE_NODE_IP="${DECODE_NODE_IP:-7.150.1.10}"
 DECODE_START_PORT="${DECODE_START_PORT:-7100}"
 DECODE_DP_RPC_PORT="${DECODE_DP_RPC_PORT:-12321}"
@@ -19,29 +19,6 @@ PREFILL_TP_SIZE=2
 DECODE_DP_SIZE=16
 DECODE_TP_SIZE=1
 
-detect_nic() {
-    python3 - "$1" <<'PY'
-import fcntl
-import os
-import socket
-import struct
-import sys
-
-target_ip = sys.argv[1]
-for interface_name in sorted(os.listdir("/sys/class/net")):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            request = struct.pack("256s", interface_name.encode()[:15])
-            response = fcntl.ioctl(sock.fileno(), 0x8915, request)
-            interface_ip = socket.inet_ntoa(response[20:24])
-    except OSError:
-        continue
-    if interface_ip == target_ip:
-        print(interface_name)
-        break
-PY
-}
-
 activate_runtime() {
     if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
         # shellcheck disable=SC1091
@@ -53,7 +30,6 @@ activate_runtime() {
 }
 
 activate_runtime
-NIC_NAME="${NIC_NAME:-$(detect_nic "${DECODE_NODE_IP}")}"
 : "${DECODE_NODE_IP:?Set DECODE_NODE_IP to the decode service IP}"
 : "${NIC_NAME:?Set NIC_NAME to the HCCL/GLOO service interface}"
 
