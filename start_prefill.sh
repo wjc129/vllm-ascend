@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-${SCRIPT_DIR}}"
 MODEL_PATH="${MODEL_PATH:-/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Flash-w8a8-mtp}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv4}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-beijing}"
 NIC_NAME="${NIC_NAME:-}"
 PREFILL_NODE_IP="${PREFILL_NODE_IP:-}"
 PREFILL_START_PORT="${PREFILL_START_PORT:-7100}"
@@ -33,10 +32,6 @@ detect_nic() {
 }
 
 activate_runtime() {
-    if command -v conda >/dev/null 2>&1; then
-        eval "$(conda shell.bash hook)"
-        conda activate "${CONDA_ENV_NAME}"
-    fi
     if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
         # shellcheck disable=SC1091
         source /usr/local/Ascend/ascend-toolkit/set_env.sh

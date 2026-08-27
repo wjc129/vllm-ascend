@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-${SCRIPT_DIR}}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-beijing}"
 PREFILL_NODE_IP="${PREFILL_NODE_IP:-prefill-node}"
 DECODE_NODE_IP="${DECODE_NODE_IP:-decode-node}"
 PREFILL_START_PORT="${PREFILL_START_PORT:-7100}"
@@ -15,11 +14,6 @@ PROXY_SCRIPT="${PROXY_SCRIPT:-${VLLM_ASCEND_HOME}/examples/disaggregated_prefill
 
 PREFILL_DP_SIZE=8
 DECODE_DP_SIZE=16
-
-if command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)"
-    conda activate "${CONDA_ENV_NAME}"
-fi
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1},${PREFILL_NODE_IP},${DECODE_NODE_IP}"
