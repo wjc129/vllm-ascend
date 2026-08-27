@@ -12,6 +12,7 @@ DECODE_DP_RPC_PORT="${DECODE_DP_RPC_PORT:-12321}"
 DECODE_KV_PORT="${DECODE_KV_PORT:-36100}"
 DECODE_ENGINE_ID="${DECODE_ENGINE_ID:-1}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/decode}"
+PID_DIR="${PID_DIR:-${SCRIPT_DIR}/run/decode}"
 
 PREFILL_DP_SIZE=8
 PREFILL_TP_SIZE=2
@@ -103,27 +104,26 @@ KV_TRANSFER_CONFIG="$(cat <<JSON
 JSON
 )"
 
-mkdir -p "${LOG_DIR}"
-pids=()
-
-cleanup() {
-    trap - EXIT INT TERM
-    if ((${#pids[@]})); then
-        kill "${pids[@]}" 2>/dev/null || true
-        wait "${pids[@]}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
+mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
 for ((rank = 0; rank < DECODE_DP_SIZE; rank++)); do
     visible_devices="${rank}"
     server_port=$((DECODE_START_PORT + rank))
     log_file="${LOG_DIR}/decode_dp${rank}.log"
+    pid_file="${PID_DIR}/decode_dp${rank}.pid"
+
+    if [[ -f "${pid_file}" ]]; then
+        existing_pid="$(<"${pid_file}")"
+        if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+            echo "Decode DP rank ${rank} is already running: pid=${existing_pid}"
+            continue
+        fi
+        rm -f "${pid_file}"
+    fi
 
     echo "Starting decode DP rank ${rank}: device=${visible_devices} port=${server_port} log=${log_file}"
-    (
-        export ASCEND_RT_VISIBLE_DEVICES="${visible_devices}"
-        exec vllm serve "${MODEL_PATH}" \
+    nohup env ASCEND_RT_VISIBLE_DEVICES="${visible_devices}" \
+        vllm serve "${MODEL_PATH}" \
             --host 0.0.0.0 \
             --port "${server_port}" \
             --data-parallel-size "${DECODE_DP_SIZE}" \
@@ -153,15 +153,12 @@ for ((rank = 0; rank < DECODE_DP_SIZE; rank++)); do
             --speculative-config '{"num_speculative_tokens": 1, "method": "mtp", "enforce_eager": true}' \
             --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
             --kv-transfer-config "${KV_TRANSFER_CONFIG}" \
-            --additional-config '{"ascend_compilation_config": {"enable_npugraph_ex": true, "enable_static_kernel": false}, "enable_cpu_binding": true, "multistream_overlap_shared_expert": true, "recompute_scheduler_enable": true}'
-    ) >"${log_file}" 2>&1 &
-    pids+=("$!")
+            --additional-config '{"ascend_compilation_config": {"enable_npugraph_ex": true, "enable_static_kernel": false}, "enable_cpu_binding": true, "multistream_overlap_shared_expert": true, "recompute_scheduler_enable": true}' \
+        >"${log_file}" 2>&1 </dev/null &
+    process_pid=$!
+    printf '%s\n' "${process_pid}" >"${pid_file}"
+    echo "Decode DP rank ${rank} started: pid=${process_pid}"
 done
 
 echo "Decode endpoints: ${DECODE_NODE_IP}:${DECODE_START_PORT}-$((DECODE_START_PORT + DECODE_DP_SIZE - 1))"
-set +e
-wait -n "${pids[@]}"
-status=$?
-set -e
-echo "A decode rank exited with status ${status}; stopping the remaining ranks." >&2
-exit "${status}"
+echo "Follow logs with: tail -F ${LOG_DIR}/decode_dp*.log"

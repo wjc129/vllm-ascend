@@ -12,6 +12,7 @@ PREFILL_DP_RPC_PORT="${PREFILL_DP_RPC_PORT:-12321}"
 PREFILL_KV_PORT="${PREFILL_KV_PORT:-36000}"
 PREFILL_ENGINE_ID="${PREFILL_ENGINE_ID:-0}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/prefill}"
+PID_DIR="${PID_DIR:-${SCRIPT_DIR}/run/prefill}"
 
 PREFILL_DP_SIZE=8
 PREFILL_TP_SIZE=2
@@ -106,28 +107,27 @@ KV_TRANSFER_CONFIG="$(cat <<JSON
 JSON
 )"
 
-mkdir -p "${LOG_DIR}"
-pids=()
-
-cleanup() {
-    trap - EXIT INT TERM
-    if ((${#pids[@]})); then
-        kill "${pids[@]}" 2>/dev/null || true
-        wait "${pids[@]}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
+mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
 for ((rank = 0; rank < PREFILL_DP_SIZE; rank++)); do
     first_device=$((rank * PREFILL_TP_SIZE))
     visible_devices="${first_device},$((first_device + 1))"
     server_port=$((PREFILL_START_PORT + rank))
     log_file="${LOG_DIR}/prefill_dp${rank}.log"
+    pid_file="${PID_DIR}/prefill_dp${rank}.pid"
+
+    if [[ -f "${pid_file}" ]]; then
+        existing_pid="$(<"${pid_file}")"
+        if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+            echo "Prefill DP rank ${rank} is already running: pid=${existing_pid}"
+            continue
+        fi
+        rm -f "${pid_file}"
+    fi
 
     echo "Starting prefill DP rank ${rank}: devices=${visible_devices} port=${server_port} log=${log_file}"
-    (
-        export ASCEND_RT_VISIBLE_DEVICES="${visible_devices}"
-        exec vllm serve "${MODEL_PATH}" \
+    nohup env ASCEND_RT_VISIBLE_DEVICES="${visible_devices}" \
+        vllm serve "${MODEL_PATH}" \
             --host 0.0.0.0 \
             --port "${server_port}" \
             --data-parallel-size "${PREFILL_DP_SIZE}" \
@@ -156,16 +156,13 @@ for ((rank = 0; rank < PREFILL_DP_SIZE; rank++)); do
             --quantization ascend \
             --enforce-eager \
             --additional-config '{"enable_cpu_binding": true, "enable_shared_expert_dp": true, "enable_dsa_cp": true}' \
-            --kv-transfer-config "${KV_TRANSFER_CONFIG}"
-    ) >"${log_file}" 2>&1 &
-    pids+=("$!")
+            --kv-transfer-config "${KV_TRANSFER_CONFIG}" \
+        >"${log_file}" 2>&1 </dev/null &
+    process_pid=$!
+    printf '%s\n' "${process_pid}" >"${pid_file}"
+    echo "Prefill DP rank ${rank} started: pid=${process_pid}"
 done
 
 echo "Prefill endpoints: ${PREFILL_NODE_IP}:${PREFILL_START_PORT}-$((PREFILL_START_PORT + PREFILL_DP_SIZE - 1))"
 echo "LoPT timing output is written to ${LOG_DIR}/prefill_dp*.log"
-set +e
-wait -n "${pids[@]}"
-status=$?
-set -e
-echo "A prefill rank exited with status ${status}; stopping the remaining ranks." >&2
-exit "${status}"
+echo "Follow logs with: tail -F ${LOG_DIR}/prefill_dp*.log"
