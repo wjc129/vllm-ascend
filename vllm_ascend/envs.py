@@ -83,8 +83,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LOPT_MIN_MATCH_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_LOPT_MIN_MATCH_TOKENS", "2")),
     # Maximum number of retries that double the LoPT chunk body length.
     "VLLM_ASCEND_LOPT_MAX_RETRIES": lambda: int(os.getenv("VLLM_ASCEND_LOPT_MAX_RETRIES", "3")),
-    # Compare LoPT output with standard tokenization before returning it.
-    # This is intended for validation and has the cost of tokenizing twice.
+    # Compare LoPT output with standard tokenization and print both timings.
+    # This is intended for benchmarking and validation and tokenizes twice.
     "VLLM_ASCEND_LOPT_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_LOPT_VERIFY", "0"))),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.

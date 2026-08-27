@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from typing import Any
@@ -554,14 +553,12 @@ def test_verify_mode_discards_a_non_lossless_chunk_result():
     assert actual == tokenizer.encode(text, **encode_kwargs(add_special_tokens=False))
 
 
-def test_verify_mode_logs_serial_and_lopt_timings(monkeypatch, caplog):
+def test_verify_mode_prints_disabled_and_enabled_lopt_timings(monkeypatch, capsys):
     tokenizer = CharacterTokenizer()
     lopt = LosslessParallelTokenizer(tokenizer, make_config(verify=True))
     text = "abcdefghijklmno"
     clock = iter([1.0, 1.01, 2.0, 2.025])
     monkeypatch.setattr(lopt_tokenizer_module.time, "perf_counter", lambda: next(clock))
-    caplog.set_level(logging.INFO, logger=lopt_tokenizer_module.logger.name)
-
     try:
         actual = lopt.encode(text, **encode_kwargs(add_special_tokens=False))
     finally:
@@ -569,9 +566,9 @@ def test_verify_mode_logs_serial_and_lopt_timings(monkeypatch, caplog):
 
     assert actual == tokenizer.encode(text, **encode_kwargs(add_special_tokens=False))
     assert (
-        "LoPT timing comparison: characters=15 tokens=15 serial_ms=25.000 "
-        "lopt_ms=10.000 speedup=2.50x matched=True chunks=4 attempts=1"
-    ) in caplog.messages
+        "LoPT timing comparison: characters=15 tokens=15 lopt_disabled_ms=25.000 "
+        "lopt_enabled_ms=10.000 speedup=2.50x matched=True chunks=4 attempts=1"
+    ) in capsys.readouterr().out
 
 
 def test_chunk_tokenization_runs_concurrently():

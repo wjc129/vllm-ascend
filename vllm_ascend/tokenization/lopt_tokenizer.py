@@ -644,14 +644,12 @@ class LosslessParallelTokenizer:
                 assert serial_started_at is not None
                 failed_lopt_ms = (failed_lopt_stopped_at - lopt_started_at) * 1000
                 serial_ms = (time.perf_counter() - serial_started_at) * 1000
-                logger.warning(
-                    "LoPT timing comparison failed: characters=%d tokens=%d serial_ms=%.3f "
-                    "failed_lopt_ms=%.3f error=%s",
-                    len(text),
-                    len(standard_ids),
-                    serial_ms,
-                    failed_lopt_ms,
-                    exc,
+                print(
+                    "LoPT timing comparison failed: "
+                    f"characters={len(text)} tokens={len(standard_ids)} "
+                    f"lopt_disabled_ms={serial_ms:.3f} "
+                    f"failed_lopt_enabled_ms={failed_lopt_ms:.3f} error={exc}",
+                    flush=True,
                 )
             return standard_ids
 
@@ -663,17 +661,13 @@ class LosslessParallelTokenizer:
             serial_ms = (time.perf_counter() - serial_started_at) * 1000
             matched = token_ids == standard_ids
             speedup = serial_ms / lopt_ms if lopt_ms > 0 else 0.0
-            logger.info(
-                "LoPT timing comparison: characters=%d tokens=%d serial_ms=%.3f "
-                "lopt_ms=%.3f speedup=%.2fx matched=%s chunks=%d attempts=%d",
-                len(text),
-                len(standard_ids),
-                serial_ms,
-                lopt_ms,
-                speedup,
-                matched,
-                chunk_count,
-                attempts,
+            print(
+                "LoPT timing comparison: "
+                f"characters={len(text)} tokens={len(standard_ids)} "
+                f"lopt_disabled_ms={serial_ms:.3f} lopt_enabled_ms={lopt_ms:.3f} "
+                f"speedup={speedup:.2f}x matched={matched} "
+                f"chunks={chunk_count} attempts={attempts}",
+                flush=True,
             )
             if not matched:
                 self._log_fallback_once("verification", "LoPT verification failed; using standard tokenization")
