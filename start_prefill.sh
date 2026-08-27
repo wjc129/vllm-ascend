@@ -19,23 +19,27 @@ PREFILL_TP_SIZE=2
 DECODE_DP_SIZE=16
 DECODE_TP_SIZE=1
 
-detect_local_ip() {
-    local detected_ip
-    detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
-    if [[ -z "${detected_ip}" ]]; then
-        detected_ip="$(hostname -I | awk '{print $1}')"
-    fi
-    printf '%s' "${detected_ip}"
-}
-
 detect_nic() {
-    local node_ip="$1"
-    local detected_nic
-    detected_nic="$(ip -o -4 addr show 2>/dev/null | awk -v target="${node_ip}" '{split($4, address, "/"); if (address[1] == target) {print $2; exit}}')"
-    if [[ -z "${detected_nic}" ]]; then
-        detected_nic="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
-    fi
-    printf '%s' "${detected_nic}"
+    python3 - "$1" <<'PY'
+import fcntl
+import os
+import socket
+import struct
+import sys
+
+target_ip = sys.argv[1]
+for interface_name in sorted(os.listdir("/sys/class/net")):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            request = struct.pack("256s", interface_name.encode()[:15])
+            response = fcntl.ioctl(sock.fileno(), 0x8915, request)
+            interface_ip = socket.inet_ntoa(response[20:24])
+    except OSError:
+        continue
+    if interface_ip == target_ip:
+        print(interface_name)
+        break
+PY
 }
 
 activate_runtime() {
@@ -49,7 +53,6 @@ activate_runtime() {
 }
 
 activate_runtime
-PREFILL_NODE_IP="${PREFILL_NODE_IP:-$(detect_local_ip)}"
 NIC_NAME="${NIC_NAME:-$(detect_nic "${PREFILL_NODE_IP}")}"
 : "${PREFILL_NODE_IP:?Set PREFILL_NODE_IP to the prefill service IP}"
 : "${NIC_NAME:?Set NIC_NAME to the HCCL/GLOO service interface}"
