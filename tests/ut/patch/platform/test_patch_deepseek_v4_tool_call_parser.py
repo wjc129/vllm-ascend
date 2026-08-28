@@ -49,6 +49,7 @@ def _stream(
     full_text: str,
     chunk_size: int = 5,
     tools=None,
+    tool_choice=None,
 ):
     deltas = []
     previous_text = ""
@@ -66,6 +67,7 @@ def _stream(
                 model="deepseek-ai/DeepSeek-V2-Chat",
                 messages=[],
                 tools=tools or [_tools()],
+                tool_choice=tool_choice,
             ),
         )
         previous_text = current_text
@@ -394,6 +396,130 @@ def test_non_streaming_keeps_complete_invoke_without_outer_end():
     assert json.loads(result.tool_calls[0].function.arguments) == {"days": 3}
 
 
+def test_non_streaming_recovers_declared_orphan_invoke():
+    parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+    model_output = (
+        "hello\n"
+        f'{INV_START}plan_trip">\n'
+        f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+        f"{INV_END}\n{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(
+        model_output,
+        ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice="auto",
+        ),
+    )
+
+    assert result.tools_called
+    assert result.content == "hello\n"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "plan_trip"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"days": 3}
+
+
+def test_non_streaming_does_not_recover_undeclared_orphan_invoke():
+    parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+    model_output = (
+        f'{INV_START}unknown_tool">\n'
+        f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+        f"{INV_END}\n{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(
+        model_output,
+        ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice="auto",
+        ),
+    )
+
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == model_output
+
+
+def test_non_streaming_does_not_recover_orphan_invoke_for_tool_choice_none():
+    parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+    model_output = (
+        f'{INV_START}plan_trip">\n'
+        f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+        f"{INV_END}\n{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(
+        model_output,
+        ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice="none",
+        ),
+    )
+
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == model_output
+
+
+def test_streaming_recovers_declared_orphan_invoke_across_chunks():
+    model_output = (
+        "hello\n"
+        f'{INV_START}plan_trip">\n'
+        f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+        f'{PARAM_START}notes" string="true">window{PARAM_END}\n'
+        f"{INV_END}\n{TC_END}"
+    )
+
+    for chunk_size in (1, 7, len(model_output)):
+        deltas = _stream(
+            DeepSeekV4ToolParser(MOCK_TOKENIZER),
+            model_output,
+            chunk_size=chunk_size,
+            tool_choice="auto",
+        )
+        content = "".join(delta.content or "" for delta in deltas)
+        arguments = "".join(
+            tool_call.function.arguments or ""
+            for delta in deltas
+            for tool_call in delta.tool_calls or []
+            if tool_call.function
+        )
+        tool_names = [
+            tool_call.function.name
+            for delta in deltas
+            for tool_call in delta.tool_calls or []
+            if tool_call.function and tool_call.function.name
+        ]
+
+        assert content == "hello\n"
+        assert tool_names == ["plan_trip"]
+        assert json.loads(arguments) == {"days": 3, "notes": "window"}
+
+
+def test_streaming_does_not_recover_undeclared_orphan_invoke():
+    model_output = (
+        f'{INV_START}unknown_tool">\n'
+        f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+        f"{INV_END}\n{TC_END}"
+    )
+
+    deltas = _stream(
+        DeepSeekV4ToolParser(MOCK_TOKENIZER),
+        model_output,
+        chunk_size=1,
+    )
+
+    assert "".join(delta.content or "" for delta in deltas) == model_output
+    assert not any(delta.tool_calls for delta in deltas)
+
+
 def test_terminal_parse_flushes_plain_text_and_resets_parser():
     parser = DelegatingParser(MOCK_TOKENIZER)
     tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
@@ -615,6 +741,70 @@ def test_configured_reasoning_parser_does_not_receive_split_dsml():
         assert content == ""
         assert "<｜DSML｜" not in content
         assert arguments == '{"notes":"unfinished'
+        reasoning_parser.extract_reasoning_streaming.assert_not_called()
+        assert tool_parser._buffer == ""
+        assert not tool_parser._in_tool_calls
+
+
+def test_configured_reasoning_parser_routes_declared_orphan_invoke():
+    for tool_choice in (None, "auto"):
+        parser = DelegatingParser(MOCK_TOKENIZER)
+        reasoning_parser = MagicMock()
+        tool_parser = DeepSeekV4ToolParser(MOCK_TOKENIZER)
+        parser.reasoning_parser = reasoning_parser
+        parser.tool_parser = tool_parser
+        parser._engine_based = False
+        parser._stream_state.engine_based = False
+        request = ChatCompletionRequest(
+            model="deepseek-ai/DeepSeek-V2-Chat",
+            messages=[],
+            tools=[_tools()],
+            tool_choice=tool_choice,
+        )
+        model_output = (
+            f'{INV_START}plan_trip">\n'
+            f'{PARAM_START}days" string="false">3{PARAM_END}\n'
+            f"{INV_END}\n{TC_END}"
+        )
+
+        deltas = []
+        for char in model_output:
+            delta = parser.parse_delta(
+                char,
+                [1],
+                request,
+                prompt_token_ids=None,
+                finished=False,
+            )
+            if delta is not None:
+                deltas.append(delta)
+        terminal_delta = parser.parse_delta(
+            "",
+            [],
+            request,
+            prompt_token_ids=None,
+            finished=True,
+        )
+        if terminal_delta is not None:
+            deltas.append(terminal_delta)
+
+        content = "".join(delta.content or "" for delta in deltas)
+        arguments = "".join(
+            tool_call.function.arguments or ""
+            for delta in deltas
+            for tool_call in delta.tool_calls or []
+            if tool_call.function
+        )
+        tool_names = [
+            tool_call.function.name
+            for delta in deltas
+            for tool_call in delta.tool_calls or []
+            if tool_call.function and tool_call.function.name
+        ]
+
+        assert content == ""
+        assert tool_names == ["plan_trip"]
+        assert json.loads(arguments) == {"days": 3}
         reasoning_parser.extract_reasoning_streaming.assert_not_called()
         assert tool_parser._buffer == ""
         assert not tool_parser._in_tool_calls

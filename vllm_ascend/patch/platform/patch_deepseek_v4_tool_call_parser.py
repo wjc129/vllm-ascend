@@ -39,6 +39,7 @@ from vllm.parser.abstract_parser import DelegatingParser
 from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
 
 ESCAPED_ARGUMENTS_PARAM_NAME = "__vllm_param_arguments__"
+ORPHAN_INVOKE_PREFIX = '<｜DSML｜invoke name="'
 
 
 def _ensure_parser_regexes(self: DeepSeekV4ToolParser) -> None:
@@ -112,6 +113,57 @@ def _function_parameters(tool):
             return function.get("parameters")
         return getattr(function, "parameters", None)
     return getattr(getattr(tool, "function", None), "parameters", None)
+
+
+def _declared_tool_names(request: ChatCompletionRequest | None) -> set[str]:
+    if (
+        request is None
+        or request.tool_choice not in (None, "auto")
+        or not request.tools
+    ):
+        return set()
+
+    return {
+        name
+        for tool in request.tools
+        if (name := _function_name(tool)) is not None
+    }
+
+
+def _find_declared_orphan_invoke_start(
+    self: DeepSeekV4ToolParser,
+    text: str,
+    request: ChatCompletionRequest | None,
+    *,
+    require_complete: bool,
+) -> int | None:
+    declared_names = _declared_tool_names(request)
+    if not declared_names:
+        return None
+
+    _ensure_parser_regexes(self)
+    pattern = (
+        self.invoke_complete_regex
+        if require_complete
+        else self.invoke_start_regex
+    )
+    for match in pattern.finditer(text):
+        if match.group(1) in declared_names:
+            return match.start()
+    return None
+
+
+def _orphan_invoke_overlap(
+    text: str,
+    request: ChatCompletionRequest | None,
+) -> int:
+    return max(
+        (
+            _partial_tag_overlap(text, f'{ORPHAN_INVOKE_PREFIX}{name}">')
+            for name in _declared_tool_names(request)
+        ),
+        default=0,
+    )
 
 
 def _extract_types_from_schema(schema: Any) -> list[str]:
@@ -349,7 +401,24 @@ def _patched_extract_tool_calls(
     request: ChatCompletionRequest,
 ) -> ExtractedToolCallInformation:
     if self.tool_call_start_token not in model_output:
-        return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+        orphan_start = _find_declared_orphan_invoke_start(
+            self,
+            model_output,
+            request,
+            require_complete=True,
+        )
+        if orphan_start is None:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        model_output = (
+            model_output[:orphan_start]
+            + self.tool_call_start_token
+            + model_output[orphan_start:]
+        )
 
     first_tool_idx = model_output.find(self.tool_call_start_token)
     content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
@@ -704,8 +773,21 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
     while True:
         if not self._in_tool_calls:
             start_idx = self._buffer.find(self.tool_call_start_token)
-            if start_idx == -1:
-                overlap = _partial_tag_overlap(self._buffer, self.tool_call_start_token)
+            orphan_start_idx = _find_declared_orphan_invoke_start(
+                self,
+                self._buffer,
+                request,
+                require_complete=False,
+            )
+            recover_orphan = orphan_start_idx is not None and (
+                start_idx == -1 or orphan_start_idx < start_idx
+            )
+
+            if start_idx == -1 and orphan_start_idx is None:
+                overlap = max(
+                    _partial_tag_overlap(self._buffer, self.tool_call_start_token),
+                    _orphan_invoke_overlap(self._buffer, request),
+                )
                 sendable_idx = len(self._buffer) - overlap
                 if sendable_idx > 0:
                     content = self._buffer[:sendable_idx]
@@ -713,13 +795,16 @@ def _process_streaming_buffer(self: DeepSeekV4ToolParser, request: ChatCompletio
                     self._queue_delta_message(DeltaMessage(content=content))
                 return
 
-            if start_idx > 0:
-                content = self._buffer[:start_idx]
-                self._buffer = self._buffer[start_idx:]
+            selected_start_idx = orphan_start_idx if recover_orphan else start_idx
+            assert selected_start_idx is not None
+            if selected_start_idx > 0:
+                content = self._buffer[:selected_start_idx]
+                self._buffer = self._buffer[selected_start_idx:]
                 self._queue_delta_message(DeltaMessage(content=content))
                 continue
 
-            self._buffer = self._buffer[len(self.tool_call_start_token) :]
+            if not recover_orphan:
+                self._buffer = self._buffer[len(self.tool_call_start_token) :]
             self._in_tool_calls = True
             continue
 
@@ -987,9 +1072,21 @@ def _patched_delegating_parse_delta(
             )
             start_token = tool_parser.tool_call_start_token
             start_idx = probe_text.find(start_token)
+            orphan_start_idx = _find_declared_orphan_invoke_start(
+                tool_parser,
+                probe_text,
+                request,
+                require_complete=False,
+            )
+            recover_orphan = orphan_start_idx is not None and (
+                start_idx == -1 or orphan_start_idx < start_idx
+            )
 
-            if start_idx == -1:
-                overlap = _partial_tag_overlap(probe_text, start_token)
+            if start_idx == -1 and orphan_start_idx is None:
+                overlap = max(
+                    _partial_tag_overlap(probe_text, start_token),
+                    _orphan_invoke_overlap(probe_text, request),
+                )
                 if overlap and not finished:
                     self._deepseek_v4_dsml_probe_text = probe_text
                     self._deepseek_v4_dsml_probe_token_ids = probe_token_ids
@@ -1003,7 +1100,9 @@ def _patched_delegating_parse_delta(
                 delta_text = probe_text
                 delta_token_ids = probe_token_ids
             else:
-                text_before_dsml = probe_text[:start_idx]
+                selected_start_idx = orphan_start_idx if recover_orphan else start_idx
+                assert selected_start_idx is not None
+                text_before_dsml = probe_text[:selected_start_idx]
                 if text_before_dsml:
                     prefix_delta = _original_delegating_parse_delta(
                         self,
@@ -1022,7 +1121,7 @@ def _patched_delegating_parse_delta(
                 state.reasoning_ended = True
                 state.prompt_reasoning_checked = True
                 state.tool_call_text_started = False
-                delta_text = probe_text[start_idx:]
+                delta_text = probe_text[selected_start_idx:]
                 delta_token_ids = probe_token_ids
 
             self._deepseek_v4_dsml_probe_text = ""
