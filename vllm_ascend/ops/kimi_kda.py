@@ -41,8 +41,10 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from vllm_ascend.ops.cannbot_dsl.flash_kda import flash_kda
-from vllm_ascend.ops.cannbot_dsl.fused_recurrent_kda import fused_recurrent_kda_op
+from ops.cannbot_dsl.flash_kda import flash_kda as _flash_kda_impl
+from ops.cannbot_dsl.fused_recurrent_kda import (
+    fused_recurrent_kda_op as _recurrent_kda_impl,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -422,7 +424,7 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             )
 
         sequence_shape = (batch_size, sequence_length, self.local_num_heads, self.head_dim)
-        output = fused_recurrent_kda_op(
+        output = _recurrent_kda_impl(
             q.reshape(sequence_shape).contiguous(),
             k.reshape(sequence_shape).contiguous(),
             v.reshape(sequence_shape).contiguous(),
@@ -504,7 +506,7 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             padded_gate[request_index, :length] = flat_gate[start:end]
             padded_beta[request_index, :length] = flat_beta[start:end]
 
-        padded_output, final_state = flash_kda(
+        padded_output, final_state = _flash_kda_impl(
             padded_q.contiguous(),
             padded_k.contiguous(),
             padded_v.contiguous(),
