@@ -1,27 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from torch import nn
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from vllm_ascend.ops.kimi_kda import (
-    _PACKED_CONV_WEIGHT_NAME,
-    AscendKimiK3DeltaAttention,
-    _KDAFusedBFGLinear,
-    _prepare_beta,
-    _zero_padded_output,
-    _zero_padded_recurrent_output,
-)
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
 )
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
+
+# Exercise the adapter contract without loading the Atlas 950 compiler or
+# native convolution library. Restore the dependency modules after import so
+# other tests can import their real implementations independently.
+with pytest.MonkeyPatch.context() as _kernel_modules:
+    for _module_name in (
+        "cann_ops_transformer",
+        "cann_ops_transformer.ops",
+        "ops.cannbot_dsl.flash_kda",
+        "ops.cannbot_dsl.fused_recurrent_kda",
+    ):
+        _kernel_modules.setitem(sys.modules, _module_name, MagicMock())
+    from vllm_ascend.ops.kimi_kda import (
+        _PACKED_CONV_WEIGHT_NAME,
+        AscendKimiK3DeltaAttention,
+        _KDAFusedBFGLinear,
+        _zero_padded_output,
+        _zero_padded_recurrent_output,
+    )
 
 
 class _RecordingLinear(nn.Module):
@@ -100,6 +113,7 @@ def test_kda_output_norm_uses_checkpoint_epsilon():
         attention.o_norm = SimpleNamespace(eps=1e-5)
         attention.conv_size = 4
         attention.local_projection_size = 2
+        attention.gate_lower_bound = -5.0
         attention.model_config = SimpleNamespace(dtype=torch.bfloat16)
         attention.conv1d = nn.Module()
         attention.conv1d.weight = nn.Parameter(torch.empty(6, 1, 4))
@@ -119,38 +133,6 @@ def test_kda_output_norm_uses_checkpoint_epsilon():
         attention = AscendKimiK3DeltaAttention(config, vllm_config)
 
     assert attention.o_norm.eps == config.rms_norm_eps
-
-
-def test_prepare_beta_slices_and_applies_sigmoid_in_fp32():
-    raw_beta = torch.tensor(
-        [[[-20.0], [0.0], [20.0], [100.0]]],
-        dtype=torch.bfloat16,
-    )
-
-    beta = _prepare_beta(raw_beta, num_actual_tokens=3)
-
-    assert beta.dtype == torch.float32
-    assert beta.shape == (1, 3, 1)
-    torch.testing.assert_close(beta, raw_beta[:, :3].float().sigmoid())
-    assert torch.all((beta >= 0.0) & (beta <= 1.0))
-
-
-def test_prepare_beta_does_not_repeat_auxiliary_sigmoid():
-    raw_beta = torch.tensor(
-        [[[-20.0], [0.0], [20.0], [100.0]]],
-        dtype=torch.bfloat16,
-    )
-    preprocessed_beta = raw_beta.float().sigmoid()
-
-    beta = _prepare_beta(
-        preprocessed_beta,
-        num_actual_tokens=3,
-        is_preprocessed=True,
-    )
-
-    assert beta.dtype == torch.float32
-    assert beta.shape == (1, 3, 1)
-    torch.testing.assert_close(beta, preprocessed_beta[:, :3])
 
 
 @pytest.mark.parametrize("f_b_is_local", [False, True])
@@ -236,13 +218,13 @@ def test_fused_bfg_projection_preserves_staged_outputs():
     assert projected_bfg is fused_output
 
     beta, raw_gate, output_gate = attention._postprocess_bfg(projected_bfg)
-    assert beta.dtype == torch.float32
-    torch.testing.assert_close(beta, fused_output[:, :2].float().sigmoid().unsqueeze(0))
+    assert beta.dtype == torch.bfloat16
+    torch.testing.assert_close(beta, fused_output[:, :2].unsqueeze(0))
     torch.testing.assert_close(raw_gate, fused_output[:, 2:8].reshape(4, 2, 3).unsqueeze(0))
     torch.testing.assert_close(output_gate, fused_output[:, 8:].reshape(4, 2, 3))
 
 
-def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
+def test_mixed_forward_passes_raw_auxiliary_beta():
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)
     attention.uses_mixed_projection = True
@@ -251,7 +233,7 @@ def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
     hidden_states = torch.randn(4, 6)
     positions = torch.arange(4)
     mixed_qkv = torch.randn(4, 18)
-    beta = torch.rand(1, 4, 2, dtype=torch.float32)
+    beta = torch.tensor([-20.0, 20.0], dtype=torch.bfloat16).expand(1, 4, 2)
     raw_gate = torch.randn(1, 4, 2, 3)
     output_gate = torch.randn(4, 2, 3)
     projected = torch.randn(4, 6)
@@ -263,7 +245,54 @@ def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
 
     assert actual is projected
     assert attention._forward.call_args.kwargs["beta"] is beta
-    assert attention._forward.call_args.kwargs["beta_is_preprocessed"] is True
+
+
+def test_forward_slices_raw_beta_and_clears_graph_padding():
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    attention.prefix = "model.layers.0.self_attn"
+    attention.local_num_heads = 1
+    attention.head_dim = 2
+    attention.kv_cache = (torch.empty(4, 6, 3), torch.empty(4, 1, 2, 2))
+    attention.register_parameter(_PACKED_CONV_WEIGHT_NAME, nn.Parameter(torch.empty(4, 6)))
+    attention._run_causal_conv1d = MagicMock(side_effect=lambda x, *_args, **_kwargs: x)
+    attention._run_recurrent = MagicMock(side_effect=lambda q, *_args, **_kwargs: q)
+    attention.o_norm = MagicMock(side_effect=lambda output, _gate: output)
+    metadata = MagicMock(spec=GDNAttentionMetadata)
+    metadata.num_actual_tokens = 3
+    metadata.spec_sequence_masks = None
+    metadata.spec_token_indx = None
+    metadata.non_spec_token_indx = None
+    metadata.num_prefills = 0
+    metadata.num_decodes = 2
+    metadata.num_decode_tokens = 2
+    metadata.non_spec_query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    metadata.non_spec_state_indices_tensor = torch.tensor([3, 1, -1], dtype=torch.int32)
+    metadata.non_spec_decode_metadata = SimpleNamespace(
+        causal_conv1d=SimpleNamespace(
+            query_start_loc=metadata.non_spec_query_start_loc,
+            cache_indices=metadata.non_spec_state_indices_tensor,
+        )
+    )
+    mixed_qkv = torch.arange(24, dtype=torch.bfloat16).reshape(4, 6)
+    raw_beta = torch.tensor([[[-20.0], [0.0], [20.0], [100.0]]], dtype=torch.bfloat16)
+    output = torch.full((1, 4, 1, 2), torch.nan, dtype=torch.bfloat16)
+
+    with patch(
+        "vllm_ascend.ops.kimi_kda.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+    ):
+        attention._forward(
+            mixed_qkv=mixed_qkv,
+            g1=torch.zeros(1, 4, 1, 2, dtype=torch.bfloat16),
+            g2=torch.zeros(4, 1, 2, dtype=torch.bfloat16),
+            beta=raw_beta,
+            core_attn_out=output,
+        )
+
+    torch.testing.assert_close(attention._run_recurrent.call_args.args[4], raw_beta[:, :3])
+    torch.testing.assert_close(output[0, :2, 0], mixed_qkv[:2, :2])
+    assert torch.equal(output[:, 2:], torch.zeros_like(output[:, 2:]))
 
 
 def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap():
@@ -395,40 +424,71 @@ def test_fused_qkv_keeps_non_mxfp_quantization_in_linear_apply():
     adapter.apply.assert_called_once_with(attention.in_proj_qkvgfab, hidden_states, bias=None)
 
 
-def test_prefill_fuses_raw_gate_and_updates_v_first_state():
+@pytest.mark.parametrize("compact_metadata", [False, True])
+def test_prefill_pads_requests_and_restores_output_and_state(compact_metadata: bool):
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)
+    attention.local_num_heads = 1
     attention.head_dim = 2
-    attention.gate_lower_bound = None
+    attention.gate_lower_bound = -5.0
     attention.A_log = nn.Parameter(torch.randn(1))
     attention.dt_bias = nn.Parameter(torch.randn(2))
 
-    q = torch.randn(1, 2, 1, 2)
+    # A short request and one crossing a 64-token boundary share a padded
+    # batch. Asymmetric state values catch accidental V/K transposition.
+    q = torch.arange(134, dtype=torch.bfloat16).reshape(1, 67, 1, 2)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_gate = torch.randn_like(q)
-    beta = torch.randn(1, 2, 1)
-    recurrent_state = torch.randn(1, 1, 2, 2)
-    state_indices = torch.tensor([0], dtype=torch.int32)
-    has_initial_state = torch.tensor([True])
+    beta = torch.linspace(-20, 20, 67, dtype=torch.bfloat16).reshape(1, 67, 1)
+    recurrent_state = torch.arange(16, dtype=torch.bfloat16).reshape(4, 1, 2, 2)
+    original_state = recurrent_state.clone()
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    has_initial_state = torch.tensor([True, False])
     metadata = SimpleNamespace(
-        cu_seqlens_host=(0, 2),
+        cu_seqlens_host=(0, 2, 67),
         cu_seqlens_kern=None,
         keep_meta=None,
-        chunk_indices_chunk64_host=(0, 0),
     )
-    output = torch.randn_like(v)
-    final_state = torch.randn(1, 1, 2, 2)
+    if compact_metadata:
+        metadata.cu_seqlens_host = (0, 2, 2, 67)
+        metadata.cu_seqlens_kern = torch.tensor([0, 2, 67], dtype=torch.int32)
+        metadata.keep_meta = torch.tensor([True, False, True])
+        state_indices = torch.tensor([3, 2, 1], dtype=torch.int32)
+        has_initial_state = torch.tensor([True, True, False])
+    final_state = torch.tensor([[[[1.25, 2.5], [3.75, 4.0]]], [[[5.0, 6.5], [7.25, 8.0]]]])
+
+    def clear_initial_state(state, has_initial):
+        state[~has_initial] = 0
+
+    def flash_kda(q_batch, k_batch, v_batch, **kwargs):
+        assert q_batch.shape == (2, 128, 1, 2)
+        assert kwargs["initial_state"].dtype == torch.float32
+        torch.testing.assert_close(kwargs["initial_state"][0], original_state[3].float())
+        assert torch.count_nonzero(kwargs["initial_state"][1]) == 0
+        for packed, batched in ((q, q_batch), (k, k_batch), (v, v_batch)):
+            torch.testing.assert_close(batched[0, :2], packed[0, :2])
+            torch.testing.assert_close(batched[1, :65], packed[0, 2:])
+            assert torch.count_nonzero(batched[0, 2:]) == 0
+            assert torch.count_nonzero(batched[1, 65:]) == 0
+        for packed, name in ((raw_gate, "g"), (beta, "beta")):
+            batched = kwargs[name]
+            torch.testing.assert_close(batched[0, :2], packed[0, :2])
+            torch.testing.assert_close(batched[1, :65], packed[0, 2:])
+            assert torch.isneginf(batched[0, 2:]).all()
+            assert torch.isneginf(batched[1, 65:]).all()
+        assert kwargs["beta"].dtype == beta.dtype
+        assert kwargs["lower_bound"] == -5.0
+        assert kwargs["layout_qkv"] == "BSND"
+        # Poison the padded output so that any failure to unpad is visible.
+        output = torch.full_like(q_batch, torch.nan)
+        output[0, :2] = q_batch[0, :2]
+        output[1, :65] = q_batch[1, :65]
+        return output, final_state
 
     with (
-        patch("vllm_ascend.ops.kimi_kda.clear_ssm_states"),
-        patch("vllm_ascend.ops.kimi_kda.l2norm_fwd", side_effect=lambda x: x),
-        patch.object(
-            torch.ops._C_ascend,
-            "chunk_kda_fwd",
-            return_value=(output, final_state, *([None] * 10)),
-            create=True,
-        ) as chunk_kda_fwd,
+        patch("vllm_ascend.ops.kimi_kda.clear_ssm_states", side_effect=clear_initial_state),
+        patch("vllm_ascend.ops.kimi_kda._flash_kda_impl", side_effect=flash_kda),
     ):
         actual = attention._run_prefill(
             q,
@@ -442,12 +502,253 @@ def test_prefill_fuses_raw_gate_and_updates_v_first_state():
             metadata,
         )
 
-    assert actual is output
-    assert chunk_kda_fwd.call_args.args[3] is raw_gate
-    assert chunk_kda_fwd.call_args.kwargs["use_gate_in_kernel"] is True
-    assert chunk_kda_fwd.call_args.kwargs["state_v_first"] is True
-    assert chunk_kda_fwd.call_args.kwargs["safe_gate"] is False
-    torch.testing.assert_close(recurrent_state[state_indices], final_state)
+    torch.testing.assert_close(actual, q)
+    torch.testing.assert_close(recurrent_state[[3, 1]], final_state.to(recurrent_state.dtype))
+    torch.testing.assert_close(recurrent_state[[0, 2]], original_state[[0, 2]])
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_recurrent_preserves_raw_beta_state_slots_and_token_order(speculative: bool):
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    attention.local_num_heads = 1
+    attention.head_dim = 2
+    attention.gate_lower_bound = -5.0
+    attention.A_log = nn.Parameter(torch.randn(1))
+    attention.dt_bias = nn.Parameter(torch.randn(2))
+
+    sequence_length = 3 if speculative else 1
+    num_tokens = 2 * sequence_length
+    q = torch.arange(num_tokens * 2, dtype=torch.bfloat16).reshape(1, num_tokens, 1, 2)
+    k, v, gate = (torch.randn_like(q) for _ in range(3))
+    beta = torch.linspace(-20, 20, num_tokens, dtype=torch.bfloat16).reshape(1, num_tokens, 1)
+    state = torch.zeros(8, 1, 2, 2)
+    indices = torch.tensor([[3, 4, 5], [1, 2, 6]] if speculative else [3, 1], dtype=torch.int32)
+    accepted = torch.tensor([2, 1], dtype=torch.int32) if speculative else None
+    query_start_loc = torch.tensor([0, sequence_length, num_tokens], dtype=torch.int32)
+
+    def recurrent_kda(q_batch, k_batch, v_batch, state_arg, beta_batch, gate_batch, *args, **kwargs):
+        assert q_batch.shape == (2, sequence_length, 1, 2)
+        for packed, batched in ((q, q_batch), (k, k_batch), (v, v_batch), (gate, gate_batch)):
+            torch.testing.assert_close(batched.flatten(0, 1), packed.squeeze(0))
+        torch.testing.assert_close(beta_batch.reshape_as(beta), beta)
+        assert state_arg is state
+        torch.testing.assert_close(kwargs["ssm_state_indices"], indices.flatten())
+        assert kwargs["num_accepted_tokens"] is accepted
+        torch.testing.assert_close(
+            kwargs["query_lengths"],
+            torch.tensor([sequence_length, sequence_length], dtype=torch.int32),
+        )
+        return q_batch.clone()
+
+    with patch("vllm_ascend.ops.kimi_kda._recurrent_kda_impl", side_effect=recurrent_kda):
+        actual = attention._run_recurrent(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            query_start_loc,
+            indices,
+            num_accepted_tokens=accepted,
+        )
+
+    torch.testing.assert_close(actual, q)
+
+
+@pytest.mark.parametrize("num_input_tokens", [3, 4])
+def test_recurrent_unpacks_short_drafts_and_skips_empty_rows(num_input_tokens: int):
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    attention.local_num_heads = 1
+    attention.head_dim = 2
+    attention.gate_lower_bound = -5.0
+    attention.A_log = nn.Parameter(torch.randn(1))
+    attention.dt_bias = nn.Parameter(torch.randn(2))
+
+    q = torch.arange(num_input_tokens * 2, dtype=torch.bfloat16).reshape(1, num_input_tokens, 1, 2)
+    k, v, gate = (torch.randn_like(q) for _ in range(3))
+    beta = torch.linspace(-20, 20, num_input_tokens, dtype=torch.bfloat16).reshape(1, num_input_tokens, 1)
+    # MRV2 pages can contain other cache data between recurrent states.
+    state_pages = torch.arange(64, dtype=torch.float32).reshape(8, 2, 1, 2, 2)
+    state = state_pages[:, 0]
+    assert not state.is_contiguous()
+    indices = torch.tensor([[3, 4, -1], [1, -1, -1], [-1, -1, -1]], dtype=torch.int32)
+    accepted = torch.tensor([1, 1, 0], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3, 3], dtype=torch.int32)
+
+    def recurrent_kda(q_batch, k_batch, v_batch, state_arg, beta_batch, gate_batch, *args, **kwargs):
+        assert q_batch.shape == (3, 3, 1, 2)
+        assert state_arg is state
+        torch.testing.assert_close(kwargs["ssm_state_indices"], indices.flatten())
+        torch.testing.assert_close(kwargs["query_lengths"], torch.tensor([2, 1, 0], dtype=torch.int32))
+        assert kwargs["num_accepted_tokens"] is accepted
+        valid = torch.tensor([[True, True, False], [True, False, False], [False, False, False]])
+        for packed, batched in ((q, q_batch), (k, k_batch), (v, v_batch)):
+            torch.testing.assert_close(batched[0, :2], packed[0, :2])
+            torch.testing.assert_close(batched[1, :1], packed[0, 2:3])
+            assert torch.count_nonzero(batched[~valid]) == 0
+        torch.testing.assert_close(beta_batch[0, :2, :, 0], beta[0, :2])
+        torch.testing.assert_close(beta_batch[1, :1, :, 0], beta[0, 2:3])
+        assert torch.isneginf(beta_batch[~valid]).all()
+        torch.testing.assert_close(gate_batch[0, :2], gate[0, :2])
+        torch.testing.assert_close(gate_batch[1, :1], gate[0, 2:3])
+        assert torch.isneginf(gate_batch[~valid]).all()
+        # Inactive kernel rows are undefined; neither request padding nor
+        # an empty sequence may leak them into the packed output.
+        output = torch.full_like(q_batch, torch.nan)
+        output[valid] = q_batch[valid] + 10
+        return output
+
+    with patch("vllm_ascend.ops.kimi_kda._recurrent_kda_impl", side_effect=recurrent_kda):
+        actual = attention._run_recurrent(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            query_start_loc,
+            indices,
+            num_accepted_tokens=accepted,
+        )
+
+    assert actual.shape == q.shape
+    torch.testing.assert_close(actual[:, :3], q[:, :3] + 10)
+    assert torch.equal(actual[:, 3:], torch.zeros_like(actual[:, 3:]))
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("run_mode", [0, 1])
+def test_causal_conv_dispatches_initial_state_and_accepted_tokens(run_mode: int):
+    mixed_qkv = torch.randn(4, 6)
+    weight = torch.randn(4, 6)
+    state = torch.randn(8, 6, 3)
+    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    indices = torch.tensor([[3, 4], [1, 2]], dtype=torch.int32)
+    initial_state = torch.tensor([True, False])
+    accepted = torch.tensor([2, 1], dtype=torch.int32)
+    expected = torch.randn_like(mixed_qkv)
+    op_name = "causal_conv1d_fn" if run_mode == 0 else "causal_conv1d_update"
+
+    with patch.object(torch.ops.cann_ops_transformer, op_name, return_value=expected, create=True) as conv:
+        actual = AscendKimiK3DeltaAttention._run_causal_conv1d(
+            mixed_qkv,
+            weight,
+            state,
+            query_start_loc,
+            indices,
+            initial_state if run_mode == 0 else None,
+            run_mode=run_mode,
+            num_accepted_tokens=accepted if run_mode == 1 else None,
+        )
+
+    assert actual is expected
+    kwargs = conv.call_args.kwargs
+    assert kwargs["x"] is mixed_qkv
+    assert kwargs["weight"] is weight
+    assert kwargs["query_start_loc"] is query_start_loc
+    if run_mode == 0:
+        assert kwargs["conv_states"] is state
+        torch.testing.assert_close(kwargs["cache_indices"], indices[:, 0])
+        torch.testing.assert_close(kwargs["has_initial_state"], initial_state.to(torch.int32))
+    else:
+        assert kwargs["conv_state"] is state
+        torch.testing.assert_close(kwargs["conv_state_indices"], indices[:, 0])
+        assert kwargs["num_accepted_tokens"] is accepted
+
+
+@pytest.mark.parametrize("run_mode", [0, 1])
+def test_causal_conv_updates_only_selected_pages_in_strided_state(run_mode: int):
+    mixed_qkv = torch.randn(4, 6)
+    weight = torch.randn(4, 6)
+    state_pages = torch.arange(216, dtype=torch.float32).reshape(6, 2, 6, 3)
+    state = state_pages[:, 0]
+    original_pages = state_pages.clone()
+    assert not state.is_contiguous()
+    query_start_loc = torch.tensor([0, 2, 4, 4], dtype=torch.int32)
+    indices = torch.tensor([3, 1, 0], dtype=torch.int32)
+    initial_state = torch.tensor([True, True, False])
+    accepted = torch.tensor([2, 1, 0], dtype=torch.int32)
+    expected_output = torch.randn_like(mixed_qkv)
+    op_name = "causal_conv1d_fn" if run_mode == 0 else "causal_conv1d_update"
+
+    def causal_conv(**kwargs):
+        kernel_state = kwargs["conv_states" if run_mode == 0 else "conv_state"]
+        kernel_indices = kwargs["cache_indices" if run_mode == 0 else "conv_state_indices"]
+        assert kernel_state.is_contiguous()
+        assert kernel_state.shape == (4, 6, 3)
+        torch.testing.assert_close(kernel_indices, torch.tensor([1, 2, 0], dtype=torch.int32))
+        assert torch.count_nonzero(kernel_state[0]) == 0
+        torch.testing.assert_close(kernel_state[1], original_pages[3, 0])
+        torch.testing.assert_close(kernel_state[2], original_pages[1, 0])
+        kernel_state[1].add_(100)
+        kernel_state[2].add_(200)
+        return expected_output
+
+    with patch.object(torch.ops.cann_ops_transformer, op_name, side_effect=causal_conv, create=True):
+        actual = AscendKimiK3DeltaAttention._run_causal_conv1d(
+            mixed_qkv,
+            weight,
+            state,
+            query_start_loc,
+            indices,
+            initial_state if run_mode == 0 else None,
+            run_mode=run_mode,
+            num_accepted_tokens=accepted if run_mode == 1 else None,
+        )
+
+    assert actual is expected_output
+    expected_pages = original_pages.clone()
+    expected_pages[3, 0].add_(100)
+    expected_pages[1, 0].add_(200)
+    # Comparing the backing pages also catches changes to the null slot,
+    # unselected requests, or the data between consecutive cache states.
+    torch.testing.assert_close(state_pages, expected_pages)
+    torch.testing.assert_close(state[0], original_pages[0, 0])
+
+
+@pytest.mark.parametrize("run_mode", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_causal_conv_maps_empty_queries_to_null_slot(run_mode: int, strided: bool):
+    mixed_qkv = torch.randn(1, 6)
+    state_pages = torch.arange(144, dtype=torch.float32).reshape(4, 2, 6, 3)
+    state = state_pages[:, 0]
+    if not strided:
+        state = state.contiguous()
+    original_state = state.clone()
+    indices = torch.tensor([2, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 1], dtype=torch.int32)
+    op_name = "causal_conv1d_fn" if run_mode == 0 else "causal_conv1d_update"
+    expected_output = torch.randn_like(mixed_qkv)
+
+    def causal_conv(**kwargs):
+        kernel_state = kwargs["conv_states" if run_mode == 0 else "conv_state"]
+        kernel_indices = kwargs["cache_indices" if run_mode == 0 else "conv_state_indices"]
+        expected_indices = torch.tensor([1 if strided else 2, 0], dtype=torch.int32)
+        torch.testing.assert_close(kernel_indices, expected_indices)
+        # CANN can touch every non-null state even when its query is empty.
+        kernel_state.index_fill_(0, kernel_indices[kernel_indices != 0].long(), -123)
+        return expected_output
+
+    with patch.object(torch.ops.cann_ops_transformer, op_name, side_effect=causal_conv, create=True):
+        actual = AscendKimiK3DeltaAttention._run_causal_conv1d(
+            mixed_qkv,
+            torch.randn(4, 6),
+            state,
+            query_start_loc,
+            indices,
+            torch.tensor([True, True]) if run_mode == 0 else None,
+            run_mode=run_mode,
+            num_accepted_tokens=torch.tensor([1, 0], dtype=torch.int32) if run_mode == 1 else None,
+        )
+
+    assert actual is expected_output
+    expected_state = original_state.clone()
+    expected_state[2].fill_(-123)
+    torch.testing.assert_close(state, expected_state)
+    torch.testing.assert_close(state[3], original_state[3])
 
 
 def test_kda_empty_forward_context_clears_preallocated_output():

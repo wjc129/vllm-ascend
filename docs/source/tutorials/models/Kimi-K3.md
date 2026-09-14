@@ -11,6 +11,8 @@ This document will show the main verification steps of the model, including supp
 
 This document is validated and written based on **vLLM-Ascend `v0.27.1rc`**.
 
+This fork's `v0.27.0` branch ports the Atlas 950 CANNBot KDA kernels onto that upstream baseline. The deployment results below describe the upstream implementation; this replacement still requires validation on Atlas 950. See [CANNBot kernel and v0.27 integration differences](Kimi-K3-CANNBot-Kernel-Diff.md) for its scope and requirements.
+
 The current release includes a subset of the Kimi K3 optimization features that have been validated for this version. To provide a reproducible and supportable baseline, this guide uses fixed deployment configurations instead of exposing every tunable optimization.
 
 These configurations position Kimi K3 for native multimodal inference, reasoning and tool calling, and multi-node mixed Prefill/Decode or PD separation deployments on Atlas 800 A3, A2, and Atlas 950DT. Additional optimization features and configuration guidance will be added in later releases after validation.
@@ -270,6 +272,7 @@ Select an image based on your host operating system and start it on every node. 
 If you don't want to use the docker image as above, you can also build all from source:
 
 - Install `vllm-ascend` from source, refer to [installation](../../getting_started/installation.md).
+- On Atlas 950, install the KDA kernel compiler dependencies with `pip install ninja==1.13.0 cannbot-dsl`. The A5 Dockerfiles include these dependencies when building this branch.
 
 If you want to deploy multi-node environment, you need to set up environment on each node.
 

@@ -4,11 +4,13 @@
 
 The projections, weight loading, and cache specification stay owned by
 upstream vLLM.  Only the CUDA-specific convolution and KDA execution is
-replaced here with the Ascend metadata builder and AscendC operators.
+replaced here with the Ascend metadata builder and CANNBot DSL kernels for
+Atlas 950.
 """
 
 from functools import wraps
 
+import cann_ops_transformer.ops  # noqa: F401
 import torch
 import torch_npu
 from einops import rearrange
@@ -22,11 +24,13 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
 )
-from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from ops.cannbot_dsl.flash_kda import flash_kda as _flash_kda_impl
+from ops.cannbot_dsl.fused_recurrent_kda import (
+    fused_recurrent_kda_op as _recurrent_kda_impl,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
@@ -172,19 +176,8 @@ def _zero_padded_recurrent_output(
     return _zero_padded_output(output, query_start_loc[-1])
 
 
-def _prepare_beta(
-    beta: torch.Tensor,
-    num_actual_tokens: int,
-    *,
-    is_preprocessed: bool = False,
-) -> torch.Tensor:
-    """Slice beta and apply sigmoid unless the auxiliary stream already did."""
-    beta = beta[:, :num_actual_tokens]
-    return beta if is_preprocessed else beta.float().sigmoid()
-
-
 class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
-    """Kimi K3 KDA using AscendC prefill and recurrent kernels."""
+    """Kimi K3 KDA using CANNBot DSL prefill and recurrent kernels on Atlas 950."""
 
     def __init__(self, config, vllm_config, prefix: str = "") -> None:
         quant_config = getattr(vllm_config, "quant_config", None)
@@ -197,6 +190,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             )(f"{prefix}.in_proj_qkvgfab")
         )
         super().__init__(config, vllm_config, prefix)
+        if self.gate_lower_bound is None:
+            raise ValueError("The Atlas 950 CANNBot KDA kernels require gate_lower_bound.")
         self.uses_mixed_projection = uses_mixed_projection
         if uses_mixed_projection:
             # vLLM 0.27 packs all KDA input projections into one linear.  A
@@ -230,7 +225,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # by the validated v0.26 implementation.
         self.o_norm.eps = config.rms_norm_eps
         # vLLM keeps the checkpoint-compatible FP32 [3C, 1, W] weight, while
-        # npu_causal_conv1d_custom consumes an activation-dtype [W, 3C]
+        # the CANN causal convolution consumes an activation-dtype [W, 3C]
         # tensor. Materialize that kernel layout once after weight loading.
         self.register_parameter(
             _PACKED_CONV_WEIGHT_NAME,
@@ -276,7 +271,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 g2=g2,
                 beta=beta,
                 core_attn_out=core_attn_out,
-                beta_is_preprocessed=True,
             )
             core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
             return self.o_proj(core_attn_out)[0]
@@ -306,10 +300,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         mixed_qkv = self._matmul_fused_qkv(quantized_qkv)
 
         with npu_stream_switch(bfg_stream):
-            # Stage 2: after both first-stage branches complete, overlap the
-            # QKV Cube matmul with beta's FP32 conversion and sigmoid vector
-            # work. Split and reshape the F/output gates here as well so all
-            # BFG output handling occurs after the QKV matmul is enqueued.
+            # Stage 2: split and reshape the raw BFG outputs after the QKV
+            # matmul is enqueued. CANNBot applies beta's sigmoid in the KDA
+            # kernel, so both projection paths pass unactivated logits.
             bfg_stream.wait_event(quant_ready)
             beta, g1, g2 = self._postprocess_bfg(fused_bfg)
             bfg_ready = bfg_stream.record_event()
@@ -335,7 +328,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             self._fused_bfg_output_sizes,
             dim=-1,
         )
-        beta = beta.float().sigmoid().unsqueeze(0)
+        beta = beta.unsqueeze(0)
         raw_gate = rearrange(raw_gate, "n (h d) -> 1 n h d", d=self.head_dim)
         output_gate = rearrange(output_gate, "n (h d) -> n h d", d=self.head_dim)
         return beta, raw_gate, output_gate
@@ -394,24 +387,63 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         run_mode: int,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        output = torch.empty_like(mixed_qkv)
-        # Consume the operator's declared output alias. Returning ``output``
-        # independently would let graph functionalization treat the custom-op
-        # result as dead and expose the uninitialized allocation instead.
-        return torch.ops._C_ascend.npu_causal_conv1d_custom(
-            output,
-            mixed_qkv,
-            conv_weights_t,
-            conv_state=conv_state,
-            bias_opt=None,
-            query_start_loc_opt=query_start_loc,
-            cache_indices_opt=cache_indices,
-            initial_state_mode_opt=initial_state_mode,
-            num_accepted_tokens_opt=num_accepted_tokens,
-            activation_mode=1,
-            pad_slot_id=PAD_SLOT_ID,
-            run_mode=run_mode,
-        )
+        if cache_indices.ndim > 1:
+            cache_indices = cache_indices[:, 0]
+        cache_indices = cache_indices.clamp_min(0).contiguous()
+        query_lengths = query_start_loc[1:] - query_start_loc[:-1]
+        has_query = torch.zeros_like(cache_indices, dtype=torch.bool)
+        has_query[: query_lengths.numel()] = query_lengths > 0
+        # The CANN update kernel can touch state even for an empty query.
+        # Map graph-padding requests to its null block before dispatch.
+        cache_indices = torch.where(has_query, cache_indices, 0)
+        kernel_state = conv_state
+        kernel_indices = cache_indices
+        if not conv_state.is_contiguous():
+            # MRV2 may place padding between cache pages. The CANN wrapper
+            # requires a contiguous state buffer, so stage only this batch's
+            # pages and copy their updates back into the original view.
+            selected_state = conv_state.index_select(0, cache_indices.long())
+            kernel_state = torch.cat(
+                (conv_state.new_zeros((1, *conv_state.shape[1:])), selected_state),
+                dim=0,
+            )
+            kernel_indices = torch.arange(
+                1, cache_indices.numel() + 1, dtype=cache_indices.dtype, device=cache_indices.device
+            )
+            # CANN reserves cache slot zero as its null block.
+            kernel_indices = torch.where(cache_indices == 0, 0, kernel_indices)
+
+        if run_mode == 0:
+            if initial_state_mode is None:
+                initial_state_mode = torch.zeros(
+                    query_start_loc.shape[0] - 1,
+                    dtype=torch.int32,
+                    device=mixed_qkv.device,
+                )
+            output = torch.ops.cann_ops_transformer.causal_conv1d_fn(
+                x=mixed_qkv,
+                conv_states=kernel_state,
+                cache_indices=kernel_indices,
+                weight=conv_weights_t,
+                bias=None,
+                query_start_loc=query_start_loc,
+                has_initial_state=initial_state_mode.to(dtype=torch.int32).contiguous(),
+            )
+        elif run_mode == 1:
+            output = torch.ops.cann_ops_transformer.causal_conv1d_update(
+                x=mixed_qkv,
+                conv_state=kernel_state,
+                conv_state_indices=kernel_indices,
+                weight=conv_weights_t,
+                bias=None,
+                query_start_loc=query_start_loc,
+                num_accepted_tokens=num_accepted_tokens,
+            )
+        else:
+            raise ValueError(f"Unsupported causal convolution run_mode: {run_mode}")
+        if kernel_state is not conv_state:
+            conv_state.index_copy_(0, cache_indices.long(), kernel_state[1:])
+        return output
 
     @torch.no_grad()
     def _pack_conv_weights(self) -> None:
@@ -437,33 +469,76 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         raw_gate: torch.Tensor,
-        beta: torch.Tensor,
+        raw_beta: torch.Tensor,
         recurrent_state: torch.Tensor,
         cu_seqlens: torch.Tensor,
         state_indices: torch.Tensor,
         *,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.ops._C_ascend.recurrent_kda(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            raw_gate.contiguous(),
-            beta.contiguous(),
+        if state_indices.ndim == 1:
+            batch_size = state_indices.shape[0]
+            sequence_length = 1
+        elif state_indices.ndim == 2:
+            batch_size, sequence_length = state_indices.shape
+        else:
+            raise ValueError(f"KDA state indices must be rank 1 or 2, got rank {state_indices.ndim}")
+
+        num_tokens = q.shape[1]
+        if num_tokens == 0:
+            return torch.zeros_like(v)
+        padded_tokens = batch_size * sequence_length
+        if num_tokens > padded_tokens or sequence_length == 0:
+            raise ValueError(
+                "KDA recurrent input exceeds the state table capacity: "
+                f"{num_tokens} > {batch_size} * {sequence_length}"
+            )
+        num_sequences = cu_seqlens.numel() - 1
+        if num_sequences < 0 or num_sequences > batch_size:
+            raise ValueError("KDA recurrent sequence boundaries do not match the state table.")
+
+        # vLLM packs only the current query tokens; the speculative state
+        # table retains its maximum draft width. Preserve device-side lengths
+        # so short drafts and zero-length graph rows never update padding slots.
+        query_lengths = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
+        query_lengths[:num_sequences] = cu_seqlens[1:] - cu_seqlens[:-1]
+        sequence_starts = torch.zeros(batch_size, dtype=torch.int64, device=q.device)
+        sequence_starts[:num_sequences] = cu_seqlens[:-1]
+        token_offsets = torch.arange(sequence_length, device=q.device)
+        valid_tokens = token_offsets.unsqueeze(0) < query_lengths.unsqueeze(1)
+        packed_indices = sequence_starts.unsqueeze(1) + token_offsets.unsqueeze(0)
+        gather_indices = packed_indices.clamp(0, num_tokens - 1).reshape(-1)
+
+        def pad_input(tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
+            trailing_shape = tensor.shape[2:]
+            padded = tensor.squeeze(0).index_select(0, gather_indices)
+            padded = padded.reshape(batch_size, sequence_length, *trailing_shape)
+            mask = valid_tokens.reshape(batch_size, sequence_length, *([1] * len(trailing_shape)))
+            return torch.where(mask, padded, fill_value).contiguous()
+
+        padded_output = _recurrent_kda_impl(
+            pad_input(q, 0.0),
+            pad_input(k, 0.0),
+            pad_input(v, 0.0),
             recurrent_state,
-            cu_seqlens,
-            state_indices,
+            pad_input(raw_beta, float("-inf")).unsqueeze(-1),
+            pad_input(raw_gate, float("-inf")),
+            self.head_dim**-0.5,
             self.A_log.reshape(-1).contiguous(),
-            self.dt_bias.contiguous(),
+            self.dt_bias.reshape(self.local_num_heads, self.head_dim).contiguous(),
+            self.gate_lower_bound,
+            "BSND",
+            ssm_state_indices=state_indices.reshape(-1).contiguous(),
             num_accepted_tokens=num_accepted_tokens,
-            scale=self.head_dim**-0.5,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=False,
-            allow_neg_eigval=False,
-            safe_gate=self.gate_lower_bound is not None,
-            lower_bound=(self.gate_lower_bound if self.gate_lower_bound is not None else -5.0),
+            query_lengths=query_lengths,
         )
+        # Give every padding row a distinct scratch destination. This avoids
+        # duplicate-index writes overwriting live outputs during graph replay.
+        scratch_indices = num_tokens + torch.arange(padded_tokens, device=q.device)
+        output_indices = torch.where(valid_tokens.reshape(-1), packed_indices.reshape(-1), scratch_indices)
+        output = v.new_zeros((num_tokens + padded_tokens, self.local_num_heads, self.head_dim))
+        output.index_copy_(0, output_indices, padded_output.reshape(-1, self.local_num_heads, self.head_dim))
+        return output[:num_tokens].unsqueeze(0)
 
     def _run_prefill(
         self,
@@ -471,7 +546,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         raw_gate: torch.Tensor,
-        beta: torch.Tensor,
+        raw_beta: torch.Tensor,
         recurrent_state: torch.Tensor,
         state_indices: torch.Tensor,
         has_initial_state: torch.Tensor,
@@ -484,40 +559,72 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         )
         keep = prebuilt_metadata.keep_meta
         if keep is not None:
+            if keep.numel() != state_indices.shape[0] or keep.numel() != has_initial_state.numel():
+                raise ValueError(
+                    "Kimi KDA prefill metadata is inconsistent: keep_meta must have "
+                    "one entry per uncompressed sequence."
+                )
             state_indices = state_indices[keep]
             has_initial_state = has_initial_state[keep]
 
-        # The recurrent cache uses [H,V,K]. The fused prefill operator accepts
-        # that state layout directly through state_v_first.
-        initial_state_vk = recurrent_state[state_indices].contiguous()
-        clear_ssm_states(initial_state_vk, has_initial_state)
+        num_sequences = (cu_seqlens.numel() if isinstance(cu_seqlens, torch.Tensor) else len(cu_seqlens)) - 1
+        if state_indices.shape[0] != num_sequences or has_initial_state.numel() != num_sequences:
+            raise ValueError(
+                "Kimi KDA prefill metadata is inconsistent: compact cu_seqlens, "
+                "state_indices, and has_initial_state must describe the same number of sequences."
+            )
 
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
-        result = torch.ops._C_ascend.chunk_kda_fwd(
-            q,
-            k,
-            v.contiguous(),
-            raw_gate.contiguous(),
-            beta.contiguous(),
-            self.head_dim**-0.5,
-            _KDA_CHUNK_SIZE,
-            layout="BSND",
-            initial_state=initial_state_vk,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
-            safe_gate=self.gate_lower_bound is not None,
-            lower_bound=self.gate_lower_bound if self.gate_lower_bound is not None else -5.0,
-            use_gate_in_kernel=True,
-            A_log=self.A_log.reshape(-1).contiguous(),
-            dt_bias=self.dt_bias.contiguous(),
-            disable_recompute=False,
-            return_intermediate_states=False,
-            state_v_first=True,
+        # CANNBot and the vLLM recurrent cache both use [H,V,K].
+        initial_state = recurrent_state[state_indices].float().contiguous()
+        clear_ssm_states(initial_state, has_initial_state)
+
+        sequence_boundaries = (
+            tuple(cu_seqlens.detach().cpu().tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
         )
-        recurrent_state[state_indices] = result[1].to(recurrent_state.dtype)
-        return result[0]
+        sequence_lengths = tuple(end - start for start, end in zip(sequence_boundaries, sequence_boundaries[1:]))
+        if not sequence_lengths or min(sequence_lengths) <= 0:
+            raise ValueError("CANNBot FlashKDA requires non-empty prefill sequences.")
+        padded_length = ((max(sequence_lengths) + _KDA_CHUNK_SIZE - 1) // _KDA_CHUNK_SIZE) * _KDA_CHUNK_SIZE
+        batch_size = len(sequence_lengths)
+        padded_shape = (batch_size, padded_length, self.local_num_heads, self.head_dim)
+        padded_q = q.new_zeros(padded_shape)
+        padded_k = k.new_zeros(padded_shape)
+        padded_v = v.new_zeros(padded_shape)
+        padded_gate = raw_gate.new_full(padded_shape, float("-inf"))
+        padded_beta = raw_beta.new_full(
+            (batch_size, padded_length, self.local_num_heads),
+            float("-inf"),
+        )
+
+        flat_q, flat_k, flat_v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
+        flat_gate, flat_beta = raw_gate.squeeze(0), raw_beta.squeeze(0)
+        for request_index, (start, end) in enumerate(zip(sequence_boundaries, sequence_boundaries[1:])):
+            length = end - start
+            padded_q[request_index, :length] = flat_q[start:end]
+            padded_k[request_index, :length] = flat_k[start:end]
+            padded_v[request_index, :length] = flat_v[start:end]
+            padded_gate[request_index, :length] = flat_gate[start:end]
+            padded_beta[request_index, :length] = flat_beta[start:end]
+
+        padded_output, final_state = _flash_kda_impl(
+            padded_q.contiguous(),
+            padded_k.contiguous(),
+            padded_v.contiguous(),
+            g=padded_gate.contiguous(),
+            beta=padded_beta.contiguous(),
+            scale=self.head_dim**-0.5,
+            initial_state=initial_state,
+            A_log=self.A_log.reshape(-1).contiguous(),
+            dt_bias=self.dt_bias.reshape(self.local_num_heads, self.head_dim).contiguous(),
+            lower_bound=self.gate_lower_bound,
+            layout_qkv="BSND",
+        )
+        recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
+        packed_output = torch.cat(
+            [padded_output[index, :length] for index, length in enumerate(sequence_lengths)],
+            dim=0,
+        )
+        return packed_output.unsqueeze(0)
 
     @eager_break_during_capture
     def _forward(
@@ -527,8 +634,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         g2: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
-        *,
-        beta_is_preprocessed: bool = False,
     ) -> None:
         """Dispatch speculative, prefill, and decode tokens through KDA kernels."""
         forward_context = get_forward_context()
@@ -545,11 +650,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         g2 = g2[:num_actual_tokens]
-        beta = _prepare_beta(
-            beta,
-            num_actual_tokens,
-            is_preprocessed=beta_is_preprocessed,
-        )
+        beta = beta[:, :num_actual_tokens]
 
         conv_state, recurrent_state = self.kv_cache
         conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)

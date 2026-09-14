@@ -508,6 +508,7 @@ setup(
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
     package_data={
+        "ops.cannbot_dsl": ["LICENSE"],
         "vllm_ascend.observability": ["config/*.yaml"],
     },
     python_requires=">=3.10",
