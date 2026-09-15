@@ -22,10 +22,11 @@ surface while routing Kimi K3 through the CANNBot DSL kernels optimized for
 Atlas 950.
 """
 
+import os
 from collections.abc import Callable
 from functools import partial, wraps
 
-import cann_ops_transformer.ops  # noqa: F401
+import cann_ops_transformer.ops
 import torch
 from einops import rearrange
 from vllm.config import VllmConfig
@@ -323,7 +324,14 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                     device=mixed_qkv.device,
                 )
             has_initial_state = has_initial_state.to(dtype=torch.int32).contiguous()
-            return torch.ops.cann_ops_transformer.causal_conv1d_fn(
+            print(
+                f"[RECIPE_CALL] BEGIN shortconv/prefill pid={os.getpid()} "
+                "op=torch.ops.cann_ops_transformer.causal_conv1d_fn "
+                f"source={cann_ops_transformer.ops.__file__} "
+                f"x_shape={tuple(mixed_qkv.shape)} dtype={mixed_qkv.dtype} device={mixed_qkv.device}",
+                flush=True,
+            )
+            output = torch.ops.cann_ops_transformer.causal_conv1d_fn(
                 x=mixed_qkv,
                 conv_states=conv_state,
                 cache_indices=cache_indices,
@@ -332,8 +340,23 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 query_start_loc=metadata.query_start_loc,
                 has_initial_state=has_initial_state,
             )
+            print(
+                f"[RECIPE_CALL] RETURN shortconv/prefill pid={os.getpid()} "
+                "op=torch.ops.cann_ops_transformer.causal_conv1d_fn "
+                f"output_shape={tuple(output.shape)} device={output.device}",
+                flush=True,
+            )
+            return output
         if run_mode == 1:
-            return torch.ops.cann_ops_transformer.causal_conv1d_update(
+            print(
+                f"[RECIPE_CALL] BEGIN shortconv/decode_or_verify pid={os.getpid()} "
+                "op=torch.ops.cann_ops_transformer.causal_conv1d_update "
+                f"source={cann_ops_transformer.ops.__file__} "
+                f"x_shape={tuple(mixed_qkv.shape)} dtype={mixed_qkv.dtype} device={mixed_qkv.device} "
+                f"speculative={num_accepted_tokens is not None}",
+                flush=True,
+            )
+            output = torch.ops.cann_ops_transformer.causal_conv1d_update(
                 x=mixed_qkv,
                 conv_state=conv_state,
                 conv_state_indices=cache_indices,
@@ -342,6 +365,13 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 query_start_loc=metadata.query_start_loc,
                 num_accepted_tokens=num_accepted_tokens,
             )
+            print(
+                f"[RECIPE_CALL] RETURN shortconv/decode_or_verify pid={os.getpid()} "
+                "op=torch.ops.cann_ops_transformer.causal_conv1d_update "
+                f"output_shape={tuple(output.shape)} device={output.device}",
+                flush=True,
+            )
+            return output
         raise ValueError(f"Unsupported causal convolution run_mode: {run_mode}")
 
     def _packed_conv_shape(self) -> tuple[int, int]:
@@ -424,6 +454,15 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             )
 
         sequence_shape = (batch_size, sequence_length, self.local_num_heads, self.head_dim)
+        # These prints trace Python dispatch/return, including graph capture.
+        # They do not synchronize the NPU or run again on graph replay.
+        print(
+            f"[RECIPE_CALL] BEGIN kda/decode_or_verify pid={os.getpid()} layer={self.prefix} "
+            f"op={_recurrent_kda_impl} entry=ops.cannbot_dsl.fused_recurrent_kda.fused_recurrent_kda_op "
+            f"q_shape={sequence_shape} dtype={q.dtype} device={q.device} "
+            f"speculative={num_accepted_tokens is not None}",
+            flush=True,
+        )
         output = _recurrent_kda_impl(
             q.reshape(sequence_shape).contiguous(),
             k.reshape(sequence_shape).contiguous(),
@@ -438,6 +477,11 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             "BSND",
             ssm_state_indices=state_indices.reshape(-1).clamp_min(0).contiguous(),
             num_accepted_tokens=num_accepted_tokens,
+        )
+        print(
+            f"[RECIPE_CALL] RETURN kda/decode_or_verify pid={os.getpid()} layer={self.prefix} "
+            f"op={_recurrent_kda_impl} output_shape={tuple(output.shape)} device={output.device}",
+            flush=True,
         )
         return output.reshape(1, expected_tokens, self.local_num_heads, self.head_dim)
 
@@ -506,6 +550,13 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             padded_gate[request_index, :length] = flat_gate[start:end]
             padded_beta[request_index, :length] = flat_beta[start:end]
 
+        print(
+            f"[RECIPE_CALL] BEGIN kda/prefill pid={os.getpid()} layer={self.prefix} "
+            f"op={_flash_kda_impl.__module__}.{_flash_kda_impl.__name__} "
+            f"source={_flash_kda_impl.__code__.co_filename} "
+            f"q_shape={tuple(padded_q.shape)} dtype={padded_q.dtype} device={padded_q.device}",
+            flush=True,
+        )
         padded_output, final_state = _flash_kda_impl(
             padded_q.contiguous(),
             padded_k.contiguous(),
@@ -518,6 +569,12 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             dt_bias=self.dt_bias.reshape(self.local_num_heads, self.head_dim).contiguous(),
             lower_bound=self.gate_lower_bound,
             layout_qkv="BSND",
+        )
+        print(
+            f"[RECIPE_CALL] RETURN kda/prefill pid={os.getpid()} layer={self.prefix} "
+            f"op={_flash_kda_impl.__module__}.{_flash_kda_impl.__name__} "
+            f"output_shape={tuple(padded_output.shape)} device={padded_output.device}",
+            flush=True,
         )
         recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
         packed_output = torch.cat(
