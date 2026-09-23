@@ -19,12 +19,14 @@
 The vLLM implementation provides the projections, cache specification, and
 opaque ``kda_attention`` custom op.  This OOT replacement keeps that public
 surface while routing prefill through the Kimi AscendC kernels and decode
-through the recurrent KDA AscendC kernel.
+through the recurrent KDA AscendC kernel. ShortConv uses the official CANN
+convolution interfaces independently of those KDA kernels.
 """
 
 from collections.abc import Callable
 from functools import partial, wraps
 
+import cann_ops_transformer.ops  # noqa: F401
 import torch
 from einops import rearrange
 from vllm.config import VllmConfig
@@ -44,7 +46,6 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
@@ -321,22 +322,57 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         run_mode: int,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out = torch.empty_like(mixed_qkv)
-        torch.ops._C_ascend.npu_causal_conv1d_custom(
-            out,
-            mixed_qkv,
-            conv_weights_t,
-            conv_state=conv_state,
-            bias_opt=None,
-            query_start_loc_opt=metadata.query_start_loc,
-            cache_indices_opt=metadata.cache_indices,
-            initial_state_mode_opt=getattr(metadata, "initial_state_mode", None),
-            num_accepted_tokens_opt=num_accepted_tokens,
-            activation_mode=1,
-            pad_slot_id=PAD_SLOT_ID,
-            run_mode=run_mode,
-        )
-        return out
+        # Adapt vLLM cache metadata to the official CANN convolution APIs.
+        # Preserve initial-state flags for chunked/prefix-cache prefill.
+        cache_indices = metadata.cache_indices
+        if cache_indices.ndim > 1:
+            cache_indices = cache_indices[:, 0]
+        cache_indices = cache_indices.clamp_min(0).contiguous()
+
+        if run_mode == 0:
+            has_initial_state = getattr(metadata, "initial_state_mode", None)
+            if has_initial_state is None:
+                has_initial_state = torch.zeros(
+                    metadata.query_start_loc.shape[0] - 1,
+                    dtype=torch.int32,
+                    device=mixed_qkv.device,
+                )
+            has_initial_state = has_initial_state.to(dtype=torch.int32).contiguous()
+            return torch.ops.cann_ops_transformer.causal_conv1d_fn(
+                x=mixed_qkv,
+                conv_states=conv_state,
+                cache_indices=cache_indices,
+                weight=conv_weights_t,
+                bias=None,
+                query_start_loc=metadata.query_start_loc,
+                has_initial_state=has_initial_state,
+            )
+        if run_mode == 1:
+            if num_accepted_tokens is None:
+                # CANN's non-speculative update contract requires fixed-batch
+                # 3-D input [batch, 1, dim]. The 2-D form is reserved for
+                # variable-length speculative decode and requires real
+                # num_accepted_tokens values.
+                output = torch.ops.cann_ops_transformer.causal_conv1d_update(
+                    x=mixed_qkv.unsqueeze(1),
+                    conv_state=conv_state,
+                    conv_state_indices=cache_indices,
+                    weight=conv_weights_t,
+                    bias=None,
+                    query_start_loc=metadata.query_start_loc,
+                    num_accepted_tokens=None,
+                )
+                return output.squeeze(1)
+            return torch.ops.cann_ops_transformer.causal_conv1d_update(
+                x=mixed_qkv,
+                conv_state=conv_state,
+                conv_state_indices=cache_indices,
+                weight=conv_weights_t,
+                bias=None,
+                query_start_loc=metadata.query_start_loc,
+                num_accepted_tokens=num_accepted_tokens,
+            )
+        raise ValueError(f"Unsupported causal convolution run_mode: {run_mode}")
 
     def _packed_conv_shape(self) -> tuple[int, int]:
         local_channels = self.local_num_heads * self.head_dim

@@ -111,6 +111,131 @@ def _expected_packed_conv_weights(
     ).to(attention.model_config.dtype)
 
 
+@pytest.mark.parametrize("initial_state", [None, [True, False, True, False]])
+@pytest.mark.parametrize("cache_layout", ["flat", "block-table"])
+def test_causal_conv1d_prefill_keeps_official_packed_varlen_contract(initial_state, cache_layout):
+    query_start_loc = torch.tensor([0, 1, 6, 8, 8], dtype=torch.int32)
+    cache_indices = torch.tensor([2, 5, 3, -1], dtype=torch.int32)
+    if cache_layout == "block-table":
+        cache_indices = torch.stack((cache_indices, torch.full_like(cache_indices, 7)), dim=1)
+    metadata = SimpleNamespace(query_start_loc=query_start_loc, cache_indices=cache_indices)
+    if initial_state is not None:
+        # Model metadata can be a non-contiguous boolean view.
+        initial_state_table = torch.tensor([[value, False] for value in initial_state], dtype=torch.bool)
+        metadata.initial_state_mode = initial_state_table[:, 0]
+    mixed_qkv = torch.empty(8, 6)
+    conv_weights_t = torch.empty(4, 6)
+    conv_state = torch.empty(8, 3, 6)
+    expected_output = torch.empty_like(mixed_qkv)
+
+    with patch(
+        "vllm_ascend.ops.kimi_kda.torch.ops.cann_ops_transformer.causal_conv1d_fn",
+        return_value=expected_output,
+    ) as prefill:
+        output = AscendKimiGatedDeltaNetAttention._run_causal_conv1d(
+            mixed_qkv,
+            conv_weights_t,
+            conv_state,
+            metadata,
+            run_mode=0,
+        )
+
+    prefill.assert_called_once()
+    kwargs = prefill.call_args.kwargs
+    assert output is expected_output
+    assert kwargs["x"] is mixed_qkv
+    assert kwargs["conv_states"] is conv_state
+    assert kwargs["weight"] is conv_weights_t
+    assert kwargs["bias"] is None
+    assert kwargs["query_start_loc"] is query_start_loc
+    torch.testing.assert_close(kwargs["cache_indices"], torch.tensor([2, 5, 3, 0], dtype=torch.int32))
+    assert kwargs["cache_indices"].is_contiguous()
+    expected_initial_state = (
+        torch.zeros(4, dtype=torch.int32) if initial_state is None else metadata.initial_state_mode.to(torch.int32)
+    )
+    torch.testing.assert_close(kwargs["has_initial_state"], expected_initial_state)
+    assert kwargs["has_initial_state"].is_contiguous()
+
+
+@pytest.mark.parametrize(
+    ("query_offsets", "cache_ids"),
+    [
+        pytest.param([0, 1, 2], [2, 4], id="ordinary-decode"),
+        pytest.param(
+            [0, 1, 2, 2, 2],
+            [[2, 3], [4, 5], [0, 0], [0, 0]],
+            id="graph-padding",
+        ),
+    ],
+)
+def test_causal_conv1d_update_uses_3d_fixed_batch_for_non_spec_decode(query_offsets, cache_ids):
+    query_start_loc = torch.tensor(query_offsets, dtype=torch.int32)
+    cache_indices = torch.tensor(cache_ids, dtype=torch.int32)
+    metadata = SimpleNamespace(query_start_loc=query_start_loc, cache_indices=cache_indices)
+    mixed_qkv = torch.empty(query_offsets[-1], 6)
+    conv_weights_t = torch.empty(4, 6)
+    conv_state = torch.empty(8, 6, 6)
+    operator_output = torch.empty(mixed_qkv.shape[0], 1, mixed_qkv.shape[1])
+
+    with patch(
+        "vllm_ascend.ops.kimi_kda.torch.ops.cann_ops_transformer.causal_conv1d_update",
+        return_value=operator_output,
+    ) as update:
+        output = AscendKimiGatedDeltaNetAttention._run_causal_conv1d(
+            mixed_qkv,
+            conv_weights_t,
+            conv_state,
+            metadata,
+            run_mode=1,
+        )
+
+    update.assert_called_once()
+    kwargs = update.call_args.kwargs
+    assert output.shape == mixed_qkv.shape
+    assert output.data_ptr() == operator_output.data_ptr()
+    assert kwargs["query_start_loc"] is query_start_loc
+    assert kwargs["x"].shape == (mixed_qkv.shape[0], 1, mixed_qkv.shape[1])
+    assert kwargs["x"].data_ptr() == mixed_qkv.data_ptr()
+    assert kwargs["conv_state"] is conv_state
+    assert kwargs["num_accepted_tokens"] is None
+    expected_indices = cache_indices if cache_indices.ndim == 1 else cache_indices[:, 0]
+    torch.testing.assert_close(kwargs["conv_state_indices"], expected_indices.clamp_min(0))
+    assert kwargs["conv_state_indices"].is_contiguous()
+
+
+def test_causal_conv1d_update_keeps_2d_varlen_for_spec_decode():
+    query_start_loc = torch.tensor([0, 3, 6, 6], dtype=torch.int32)
+    cache_indices = torch.tensor([[2, 3, 4], [5, 6, 7], [-1, -1, -1]], dtype=torch.int32)
+    metadata = SimpleNamespace(query_start_loc=query_start_loc, cache_indices=cache_indices)
+    mixed_qkv = torch.empty(6, 6)
+    conv_weights_t = torch.empty(4, 6)
+    conv_state = torch.empty(8, 6, 6)
+    accepted = torch.tensor([2, 1, 0], dtype=torch.int32)
+    expected_output = torch.empty_like(mixed_qkv)
+
+    with patch(
+        "vllm_ascend.ops.kimi_kda.torch.ops.cann_ops_transformer.causal_conv1d_update",
+        return_value=expected_output,
+    ) as update:
+        output = AscendKimiGatedDeltaNetAttention._run_causal_conv1d(
+            mixed_qkv,
+            conv_weights_t,
+            conv_state,
+            metadata,
+            run_mode=1,
+            num_accepted_tokens=accepted,
+        )
+
+    update.assert_called_once()
+    kwargs = update.call_args.kwargs
+    assert output is expected_output
+    assert kwargs["x"] is mixed_qkv
+    assert kwargs["conv_state"] is conv_state
+    assert kwargs["query_start_loc"] is query_start_loc
+    assert kwargs["num_accepted_tokens"] is accepted
+    torch.testing.assert_close(kwargs["conv_state_indices"], torch.tensor([2, 5, 0], dtype=torch.int32))
+
+
 def test_load_a_log_slices_padded_1d_checkpoint_by_tp_rank():
     param = torch.empty(1, 1, 2, 1)
     loaded_weight = torch.arange(6, dtype=torch.float32)
